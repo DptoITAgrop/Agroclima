@@ -1,7 +1,7 @@
 # 1) deps
 FROM node:20-alpine AS deps
 WORKDIR /app
-COPY package.json pnpm-lock.yaml* package-lock.json* yarn.lock* ./
+COPY package.json pnpm-lock.yaml* package-lock.yaml* yarn.lock* ./
 RUN corepack enable
 RUN pnpm install --frozen-lockfile
 
@@ -20,8 +20,15 @@ WORKDIR /app
 ENV NODE_ENV=production
 ENV NEXT_TELEMETRY_DISABLED=1
 
-# si usas output standalone esto es lo ideal, pero vale igual sin tocar nada:
-COPY --from=builder /app ./
+# ✅ habilita pnpm en runtime
+RUN corepack enable
+
+# Copiamos lo necesario para correr Next
+COPY --from=builder /app/package.json ./package.json
+COPY --from=builder /app/next.config.mjs ./next.config.mjs
+COPY --from=builder /app/public ./public
+COPY --from=builder /app/.next ./.next
+COPY --from=builder /app/node_modules ./node_modules
 
 EXPOSE 3000
 CMD ["pnpm","start","-p","3000"]
