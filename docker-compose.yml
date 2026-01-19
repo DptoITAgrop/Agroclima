@@ -6,9 +6,6 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-      # (opcional) args si necesitas NEXT_PUBLIC_* en build:
-      # args:
-      #   NEXT_PUBLIC_APP_URL: ${NEXT_PUBLIC_APP_URL}
 
     ports:
       - "8097:3000"
