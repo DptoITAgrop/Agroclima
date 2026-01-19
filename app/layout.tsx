@@ -15,6 +15,15 @@ export const metadata: Metadata = {
   title: "AgroClima - Análisis Climático Agrícola",
   description: "Aplicación para análisis climático orientado al cultivo de pistacho con datos históricos de 20 años",
   generator: "v0.app",
+
+  // ✅ FAVICON (tu SVG)
+  icons: {
+    icon: [
+      { url: "/apple-icon.png", type: "image/svg+xml" },
+      // ✅ fallback recomendado (si luego añades favicon.ico)
+      // { url: "/favicon.ico", type: "image/x-icon" },
+    ],
+  },
 }
 
 export default function RootLayout({
@@ -25,12 +34,16 @@ export default function RootLayout({
   return (
     <html lang="es" className={inter.variable}>
       <head>
+        {/* ✅ Leaflet */}
         <link
           rel="stylesheet"
           href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
           integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY="
           crossOrigin=""
         />
+
+        {/* ✅ Extra seguridad: algunos navegadores agradecen el link directo */}
+        <link rel="icon" href="/arbol_agroptimum.svg" type="image/svg+xml" />
       </head>
       <body className="font-sans antialiased">
         <Suspense fallback={null}>{children}</Suspense>

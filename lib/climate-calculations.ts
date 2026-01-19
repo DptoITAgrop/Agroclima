@@ -133,9 +133,17 @@ export class ClimateCalculator {
    * OJO: si viene de ERA5/NASA con computedChillHeat=true, NO recalculamos.
    */
   calculateChillHours(tempMax: number, tempMin: number): number {
-    if (tempMax <= this.params.chillThreshold) return 24
-    if (tempMin >= this.params.chillThreshold) return 0
-    const hoursBelow = (24 * (this.params.chillThreshold - tempMin)) / (tempMax - tempMin)
+    // defensivo: evita divisiones raras
+    const tmax = Number.isFinite(tempMax) ? tempMax : 0
+    const tmin = Number.isFinite(tempMin) ? tempMin : 0
+
+    if (tmax <= this.params.chillThreshold) return 24
+    if (tmin >= this.params.chillThreshold) return 0
+
+    const denom = tmax - tmin
+    if (denom === 0) return tmax < this.params.chillThreshold ? 24 : 0
+
+    const hoursBelow = (24 * (this.params.chillThreshold - tmin)) / denom
     return Math.max(0, Math.min(24, hoursBelow))
   }
 
@@ -144,14 +152,21 @@ export class ClimateCalculator {
    * OJO: si viene de ERA5 horario, frost_hours ya es real y no se recalcula.
    */
   calculateFrostHours(tempMax: number, tempMin: number): number {
-    if (tempMax <= this.params.frostThreshold) return 24
-    if (tempMin >= this.params.frostThreshold) return 0
-    const hoursBelow = (24 * (this.params.frostThreshold - tempMin)) / (tempMax - tempMin)
+    const tmax = Number.isFinite(tempMax) ? tempMax : 0
+    const tmin = Number.isFinite(tempMin) ? tempMin : 0
+
+    if (tmax <= this.params.frostThreshold) return 24
+    if (tmin >= this.params.frostThreshold) return 0
+
+    const denom = tmax - tmin
+    if (denom === 0) return tmax < this.params.frostThreshold ? 24 : 0
+
+    const hoursBelow = (24 * (this.params.frostThreshold - tmin)) / denom
     return Math.max(0, Math.min(24, hoursBelow))
   }
 
   private getDayOfYear(dateISO: string): number {
-    const date = new Date(dateISO)
+    const date = new Date(`${dateISO}T00:00:00`)
     const start = new Date(date.getFullYear(), 0, 0)
     return Math.floor((date.getTime() - start.getTime()) / (1000 * 60 * 60 * 24))
   }
@@ -161,10 +176,33 @@ export class ClimateCalculator {
     return Number.isFinite(x) ? x : fallback
   }
 
+  private getMonthDay(dateISO: string): { month: number; day: number } {
+    const d = new Date(`${dateISO}T00:00:00`)
+    return { month: d.getMonth() + 1, day: d.getDate() }
+  }
+
+  /**
+   * Ventana de Horas Frío pistacho:
+   * - desde 1 Nov hasta 1 Mar (1 Mar NO incluido)
+   * => Nov, Dic, Ene, Feb
+   */
+  private isInChillWindow(dateISO: string): boolean {
+    const { month } = this.getMonthDay(dateISO)
+    return month === 11 || month === 12 || month === 1 || month === 2
+  }
+
+  private clamp0(n: number): number {
+    return Number.isFinite(n) ? Math.max(0, n) : 0
+  }
+
   /**
    * Procesa data diaria y añade ETO/ETC SIEMPRE.
    * - Si computedChillHeat === true -> respeta gdd/chill_hours/frost_hours que vengan (ERA5/NASA)
    * - Si computedChillHeat !== true -> calcula gdd/chill/frost con el método simple
+   *
+   * ✅ REGLA CLAVE (HF):
+   * - Fuera de Nov–Feb => chill_hours = 0
+   * - Nunca negativos => clamp a 0
    */
   processClimateData(data: ClimateData[], latitude: number): ClimateData[] {
     return data.map((day) => {
@@ -179,28 +217,40 @@ export class ClimateCalculator {
       const eto = this.calculateETO(tmax, tmin, hum, ws, sr, latitude, dayOfYear)
       const etc = this.calculateETC(eto, dayOfYear)
 
-      // ✅ Si ya viene calculado (ERA5 horario o NASA UTAH/base7), NO tocarlo
-      if (day.computedChillHeat) {
+      const inChillWindow = this.isInChillWindow(day.date)
+
+      // ✅ Si ya viene calculado (ERA5 horario o NASA UTAH/base7), NO recalcular…
+      // …pero sí CAPAR fuera de ventana y clamping a 0 para evitar negativos.
+      if ((day as any).computedChillHeat) {
+        const incomingChill = this.clamp0(this.safeNum((day as any).chill_hours))
+        const incomingFrost = this.clamp0(this.safeNum((day as any).frost_hours))
+        const incomingGdd = this.clamp0(this.safeNum((day as any).gdd))
+
         return {
           ...day,
           eto: Number.parseFloat(eto.toFixed(2)),
           etc: Number.parseFloat(etc.toFixed(2)),
-          // gdd/chill_hours/frost_hours se respetan como vengan
+          gdd: Number.parseFloat(incomingGdd.toFixed(1)),
+          chill_hours: Number.parseFloat((inChillWindow ? incomingChill : 0).toFixed(1)),
+          frost_hours: Number.parseFloat(incomingFrost.toFixed(1)),
         }
       }
 
       // ✅ Caso fuentes sin cálculo (AEMET/SIAR o datasets diarios simples)
       const gdd = this.calculateGDD(tmax, tmin)
-      const chill = this.calculateChillHours(tmax, tmin)
+
+      const chillRaw = this.calculateChillHours(tmax, tmin)
+      const chill = inChillWindow ? chillRaw : 0
+
       const frost = this.calculateFrostHours(tmax, tmin)
 
       return {
         ...day,
         eto: Number.parseFloat(eto.toFixed(2)),
         etc: Number.parseFloat(etc.toFixed(2)),
-        gdd: Number.parseFloat(gdd.toFixed(1)),
-        chill_hours: Number.parseFloat(chill.toFixed(1)),
-        frost_hours: Number.parseFloat(frost.toFixed(1)),
+        gdd: Number.parseFloat(this.clamp0(gdd).toFixed(1)),
+        chill_hours: Number.parseFloat(this.clamp0(chill).toFixed(1)),
+        frost_hours: Number.parseFloat(this.clamp0(frost).toFixed(1)),
       }
     })
   }
@@ -212,16 +262,22 @@ export class ClimateCalculator {
   calculateSeasonalSummary(data: ClimateData[]): SeasonalSummary {
     const totalDays = data.length || 1
 
-    const totalGDD = data.reduce((sum, day) => sum + this.safeNum(day.gdd), 0)
-    const totalChillHours = data.reduce((sum, day) => sum + this.safeNum(day.chill_hours), 0)
-    const totalFrostHours = data.reduce((sum, day) => sum + this.safeNum(day.frost_hours), 0)
-    const totalETO = data.reduce((sum, day) => sum + this.safeNum(day.eto), 0)
-    const totalETC = data.reduce((sum, day) => sum + this.safeNum(day.etc), 0)
-    const totalPrecipitation = data.reduce((sum, day) => sum + this.safeNum(day.precipitation), 0)
+    const totalGDD = data.reduce((sum, day) => sum + this.clamp0(this.safeNum((day as any).gdd)), 0)
 
-    const frostDays = data.filter((day) => this.safeNum(day.frost_hours) > 0).length
+    // ✅ HF: solo Nov–Feb + clamp0
+    const totalChillHours = data.reduce((sum, day) => {
+      if (!this.isInChillWindow(day.date)) return sum
+      return sum + this.clamp0(this.safeNum((day as any).chill_hours))
+    }, 0)
+
+    const totalFrostHours = data.reduce((sum, day) => sum + this.clamp0(this.safeNum((day as any).frost_hours)), 0)
+    const totalETO = data.reduce((sum, day) => sum + this.clamp0(this.safeNum((day as any).eto)), 0)
+    const totalETC = data.reduce((sum, day) => sum + this.clamp0(this.safeNum((day as any).etc)), 0)
+    const totalPrecipitation = data.reduce((sum, day) => sum + this.clamp0(this.safeNum((day as any).precipitation)), 0)
+
+    const frostDays = data.filter((day) => this.clamp0(this.safeNum((day as any).frost_hours)) > 0).length
     const avgTemperature =
-      data.reduce((sum, day) => sum + this.safeNum(day.temperature_avg), 0) / totalDays
+      data.reduce((sum, day) => sum + this.safeNum((day as any).temperature_avg), 0) / totalDays
 
     return {
       totalDays: data.length,
