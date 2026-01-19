@@ -1,11 +1,13 @@
 version: "3.8"
 
 services:
-  web:
-    container_name: agroclima-web
+  agroclima:
+    container_name: agroclima
     build:
       context: .
       dockerfile: Dockerfile
+    image: agroclima:latest
+    restart: unless-stopped
 
     ports:
       - "8097:3000"
@@ -13,6 +15,11 @@ services:
     environment:
       NODE_ENV: production
       NEXT_TELEMETRY_DISABLED: "1"
-      NEXT_PUBLIC_APP_URL: ${NEXT_PUBLIC_APP_URL}
+      NEXT_PUBLIC_APP_URL: "https://agroclima.agroptimum.com"
 
-    restart: unless-stopped
+    networks:
+      - agroclima_net
+
+networks:
+  agroclima_net:
+    driver: bridge
