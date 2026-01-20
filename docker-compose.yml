@@ -10,6 +10,8 @@ services:
     restart: unless-stopped
     ports:
       - "8097:3000"
+    env_file:
+      - .env.local
     environment:
       NODE_ENV: production
       NEXT_TELEMETRY_DISABLED: "1"
