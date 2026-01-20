@@ -38,7 +38,8 @@ function addDaysYYYYMMDD(baseYYYYMMDD: string, days: number) {
 export async function POST(request: NextRequest) {
   try {
     const body = (await request.json()) as Partial<ClimateRequest>
-    const origin = request.nextUrl.origin
+    const origin = process.env.INTERNAL_BASE_URL || request.nextUrl.origin
+
 
     const isAemet = body.source === "AEMET"
 

@@ -634,10 +634,16 @@ export class WeatherService {
   private siar: SiarService
   private calculator = new ClimateCalculator()
 
-  constructor(origin: string) {
-    this.aemet = new AemetService(origin)
-    this.siar = new SiarService(origin)
-  }
+ constructor(origin: string) {
+  const internalBase =
+    process.env.INTERNAL_BASE_URL ||
+    process.env.NEXT_INTERNAL_BASE_URL ||
+    origin
+
+  this.aemet = new AemetService(internalBase)
+  this.siar = new SiarService(internalBase)
+}
+
 
   async getClimateDataBySource(request: ClimateRequest): Promise<ApiResponse<ClimateData[]>> {
     const processData = (response: ApiResponse<ClimateData[]>) => {
