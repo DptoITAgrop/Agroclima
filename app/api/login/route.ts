@@ -6,6 +6,8 @@ type Body = { email?: string; password?: string }
 const USERS = [
   { email: "dptocomercial@agroptimum.com", password: "Comerciales2026@" },
   { email: "dptotecnicos@agroptimum.com", password: "Tecnicos2026@" },
+  { email: "dptoadministracion@agroptimum.com", password: "Administracion2026@" },
+
 ]
 
 export async function POST(req: NextRequest) {
