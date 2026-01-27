@@ -24,20 +24,19 @@ interface DataInputFormProps {
 }
 
 function mapUiSourceToApi(source: UIDataSource): ApiDataSource | null {
-  switch (source) {
-    case "siar":
-      return "SIAR"
-    case "aemet":
-      return "AEMET"
-    case "nasa":
-      return "NASA_POWER"
-    case "era5":
-      return "ERA5"
-    case "all":
-      return null
-    default:
-      return null
-  }
+  // ✅ soporta variantes típicas para OPEN_METEO
+  const s = String(source).toLowerCase()
+
+  if (s === "siar") return "SIAR"
+  if (s === "aemet") return "AEMET"
+  if (s === "nasa" || s === "nasa_power" || s === "nasapower") return "NASA_POWER"
+  if (s === "era5") return "ERA5"
+
+  // ✅ importantísimo: Open Meteo
+  if (s === "open_meteo" || s === "open-meteo" || s === "openmeteo") return "OPEN_METEO"
+
+  if (s === "all") return null
+  return null
 }
 
 export function DataInputForm({ onDataFetched, onHistoricalAnalysis, selectedDataSources }: DataInputFormProps) {
@@ -112,14 +111,12 @@ export function DataInputForm({ onDataFetched, onHistoricalAnalysis, selectedDat
 
       if (!Number.isFinite(latNum) || !Number.isFinite(lonNum)) return
 
-      // ✅ requestInfo para dashboard + export
       const requestInfo: any = {
         latitude: latNum,
         longitude: lonNum,
         source: apiSource,
       }
 
-      // ✅ CLAVE: guardar CP si aplica (AEMET/SIAR)
       if (usesPostalCode) requestInfo.postalCode = postalCode.trim()
 
       if (showDates) {
@@ -128,7 +125,6 @@ export function DataInputForm({ onDataFetched, onHistoricalAnalysis, selectedDat
         requestInfo.dayCount = Math.ceil((endDate!.getTime() - startDate!.getTime()) / (1000 * 60 * 60 * 24))
       }
 
-      // ✅ Payload al hook
       const payload: any = {
         latitude: latNum,
         longitude: lonNum,
@@ -367,7 +363,7 @@ export function DataInputForm({ onDataFetched, onHistoricalAnalysis, selectedDat
         <InteractiveMap
           latitude={latitude ? Number.parseFloat(latitude) : undefined}
           longitude={longitude ? Number.parseFloat(longitude) : undefined}
-          onLocationSelect={handleLocationSelect}
+          onLocationSelect={(lat, lng) => handleLocationSelect(lat, lng)}
         />
       )}
     </div>

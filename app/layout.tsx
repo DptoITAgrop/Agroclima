@@ -1,28 +1,50 @@
 import type React from "react"
 import type { Metadata } from "next"
-import { Inter } from "next/font/google"
+import localFont from "next/font/local"
 import { Analytics } from "@vercel/analytics/next"
 import { Suspense } from "react"
 import "./globals.css"
 
-const inter = Inter({
-  subsets: ["latin"],
+// ✅ Margem (desde /public/fonts)
+// OJO: en next/font/local el path es RELATIVO al archivo actual (app/layout.tsx)
+const margem = localFont({
   variable: "--font-sans",
   display: "swap",
+  src: [
+    {
+      path: "../public/fonts/Fabio Haag Type - Margem Light.otf",
+      weight: "300",
+      style: "normal",
+    },
+    {
+      path: "../public/fonts/Fabio Haag Type - Margem Light Italic.otf",
+      weight: "300",
+      style: "italic",
+    },
+    {
+      path: "../public/fonts/Fabio Haag Type - Margem Medium.otf",
+      weight: "500",
+      style: "normal",
+    },
+    {
+      path: "../public/fonts/Fabio Haag Type - Margem Medium Italic.otf",
+      weight: "500",
+      style: "italic",
+    },
+    {
+      path: "../public/fonts/Fabio Haag Type - Margem Bold.otf",
+      weight: "700",
+      style: "normal",
+    },
+  ],
 })
 
 export const metadata: Metadata = {
   title: "AgroClima - Análisis Climático Agrícola",
   description: "Aplicación para análisis climático orientado al cultivo de pistacho con datos históricos de 20 años",
   generator: "v0.app",
-
-  // ✅ FAVICON (tu SVG)
   icons: {
-    icon: [
-      { url: "/apple-icon.png", type: "image/svg+xml" },
-      // ✅ fallback recomendado (si luego añades favicon.ico)
-      // { url: "/favicon.ico", type: "image/x-icon" },
-    ],
+    icon: [{ url: "/apple-icon.png" }],
   },
 }
 
@@ -32,7 +54,7 @@ export default function RootLayout({
   children: React.ReactNode
 }>) {
   return (
-    <html lang="es" className={inter.variable}>
+    <html lang="es" className={margem.variable}>
       <head>
         {/* ✅ Leaflet */}
         <link
@@ -41,8 +63,7 @@ export default function RootLayout({
           integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY="
           crossOrigin=""
         />
-
-        {/* ✅ Extra seguridad: algunos navegadores agradecen el link directo */}
+        {/* ✅ Favicon extra */}
         <link rel="icon" href="/arbol_agroptimum.svg" type="image/svg+xml" />
       </head>
       <body className="font-sans antialiased">
@@ -52,3 +73,4 @@ export default function RootLayout({
     </html>
   )
 }
+  

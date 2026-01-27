@@ -1,27 +1,13 @@
 import "server-only"
 import type { ClimateData, ClimateRequest, ApiResponse } from "./types"
 import { ClimateCalculator } from "./climate-calculations"
-import * as XLSX from "xlsx"
 
 // --------------------
-// Helpers: UTAH + Dynamic base 7
+// Helpers: base GDD + chill/frost (horas) + Utah (opcional)
 // --------------------
 const DYNAMIC_BASE_C = 7
-
-function utahHourlyUnits(Tc: number): number {
-  if (Tc < 1.4) return 0
-  if (Tc < 2.4) return 0.5
-  if (Tc < 9.1) return 1
-  if (Tc < 12.4) return 0.5
-  if (Tc < 15.9) return 0
-  if (Tc < 18.0) return -0.5
-  return -1
-}
-
-function utahDailyApproxUnits(tmin: number, tmax: number): number {
-  const tavg = (tmin + tmax) / 2
-  return utahHourlyUnits(tavg) * 24
-}
+const CHILL_THRESHOLD_C = 7.2
+const FROST_THRESHOLD_C = 0
 
 function dynamicHeatDailyDD(tavg: number, base = DYNAMIC_BASE_C): number {
   return Math.max(0, tavg - base)
@@ -48,6 +34,28 @@ function uniqSorted<T>(arr: T[]) {
 
 function pad2(n: number) {
   return String(n).padStart(2, "0")
+}
+
+/**
+ * Estimación diaria de "horas por debajo de umbral" usando Tmin/Tmax.
+ * Aproximación lineal (útil cuando solo tienes datos diarios).
+ *
+ * - Si Tmax <= thr => 24h
+ * - Si Tmin >= thr => 0h
+ * - Si cruza => proporción lineal
+ */
+function hoursBelowThresholdFromMinMax(tmin: number, tmax: number, thr: number): number {
+  if (!Number.isFinite(tmin) || !Number.isFinite(tmax)) return 0
+  if (tmax <= thr) return 24
+  if (tmin >= thr) return 0
+
+  // Interpolación lineal simple
+  const span = tmax - tmin
+  if (span <= 0) return tmin < thr ? 24 : 0
+
+  // Fracción del día bajo el umbral
+  const frac = (thr - tmin) / span
+  return Math.max(0, Math.min(24, frac * 24))
 }
 
 // CSV parser robusto (soporta comillas y líneas con #)
@@ -106,10 +114,6 @@ function idxOf(header: string[], names: string[]): number {
   return -1
 }
 
-function sleep(ms: number) {
-  return new Promise((r) => setTimeout(r, ms))
-}
-
 // --------------------
 // NASA POWER API Service
 // --------------------
@@ -118,6 +122,13 @@ export class NasaPowerService {
 
   async getClimateData(request: ClimateRequest): Promise<ApiResponse<ClimateData[]>> {
     try {
+      if (!request.startDate || !request.endDate) {
+        return { success: false, error: "Faltan fechas (startDate/endDate)", source: "NASA_POWER" }
+      }
+      if (typeof request.latitude !== "number" || typeof request.longitude !== "number") {
+        return { success: false, error: "Faltan coordenadas (latitude/longitude)", source: "NASA_POWER" }
+      }
+
       const parameters = ["T2M_MAX", "T2M_MIN", "T2M", "RH2M", "PRECTOTCORR", "WS2M", "ALLSKY_SFC_SW_DWN"].join(",")
 
       const start = request.startDate.replace(/-/g, "")
@@ -150,13 +161,18 @@ export class NasaPowerService {
 
       const climateData: ClimateData[] = dates.map((date: string) => {
         const formattedDate = `${date.slice(0, 4)}-${date.slice(4, 6)}-${date.slice(6, 8)}`
+
         const tmax = Number.isFinite(Number(tmaxMap[date])) ? Number(tmaxMap[date]) : 0
         const tmin = Number.isFinite(Number(tminMap[date])) ? Number(tminMap[date]) : 0
 
         const t2m = param?.T2M?.[date]
         const tavg = Number.isFinite(Number(t2m)) ? Number(t2m) : (tmax + tmin) / 2
 
-        const utahUnits = utahDailyApproxUnits(tmin, tmax)
+        // ✅ Chill/Frost en HORAS (aprox diaria con Tmin/Tmax)
+        const chillH = hoursBelowThresholdFromMinMax(tmin, tmax, CHILL_THRESHOLD_C)
+        const frostH = hoursBelowThresholdFromMinMax(tmin, tmax, FROST_THRESHOLD_C)
+
+        // ✅ GDD diario base 7°C
         const heatDD = dynamicHeatDailyDD(tavg, DYNAMIC_BASE_C)
 
         return {
@@ -170,11 +186,15 @@ export class NasaPowerService {
           solar_radiation: Number.isFinite(Number(param?.ALLSKY_SFC_SW_DWN?.[date]))
             ? Number(param.ALLSKY_SFC_SW_DWN[date])
             : 0,
+
+          // NASA POWER no da ET0/ETc aquí en tu set actual -> 0 (luego puedes calcularlo aparte)
           eto: 0,
           etc: 0,
-          frost_hours: 0,
-          chill_hours: Number(utahUnits.toFixed(2)),
+
+          frost_hours: Number(frostH.toFixed(2)),
+          chill_hours: Number(chillH.toFixed(2)),
           gdd: Number(heatDD.toFixed(2)),
+
           computedChillHeat: true,
           computedFromHourly: false,
         }
@@ -190,12 +210,15 @@ export class NasaPowerService {
 // --------------------
 // AEMET API Service (proxy)
 // --------------------
-
 export class AemetService {
   constructor(private origin: string) {}
 
   async getClimateData(request: ClimateRequest): Promise<ApiResponse<ClimateData[]>> {
     try {
+      if (!request.startDate || !request.endDate) {
+        return { success: false, error: "Faltan fechas (startDate/endDate)", source: "AEMET" }
+      }
+
       if (!request.postalCode || !/^\d{5}$/.test(String(request.postalCode).trim())) {
         return { success: false, error: "Código postal inválido (5 dígitos)", source: "AEMET" }
       }
@@ -208,8 +231,6 @@ export class AemetService {
           postalCode: request.postalCode,
           startDate: request.startDate,
           endDate: request.endDate,
-
-          // 👇 si lo mandas, mejor; si no, tu endpoint decide
           municipio: request.municipio,
         }),
       })
@@ -222,7 +243,6 @@ export class AemetService {
     }
   }
 }
-
 
 // --------------------
 // SIAR API Service (proxy)
@@ -247,33 +267,51 @@ export class SiarService {
   }
 }
 
+// --------------------
+// OPEN METEO (stub / proxy)
+// --------------------
+export class OpenMeteoService {
+  constructor(private origin: string) {}
+
+  async getClimateData(request: ClimateRequest): Promise<ApiResponse<ClimateData[]>> {
+    try {
+      // Si lo tienes como endpoint proxy, úsalo aquí
+      const response = await fetch(`${this.origin}/api/weather/open-meteo`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        cache: "no-store",
+        body: JSON.stringify(request),
+      })
+
+      const payload = await response.json().catch(() => ({}))
+      if (!response.ok) throw new Error(payload?.error || `OPEN_METEO error: ${response.status}`)
+      return payload
+    } catch (error) {
+      return {
+        success: false,
+        error: error instanceof Error ? error.message : "OPEN_METEO API error",
+        source: "OPEN_METEO",
+      }
+    }
+  }
+}
 
 // --------------------
 // ERA5 API Service (CDS Retrieve API v1)
 // ✅ Internamente pide CSV (para evitar Parquet/ZIP/NetCDF raros)
 // ✅ Devuelve ClimateData[] (para análisis)
-// ✅ También puede generar XLSX (para tu botón de descarga)
 // --------------------
 export class Era5Service {
   private cdsBaseUrl = process.env.CDS_BASE_URL || "https://cds.climate.copernicus.eu/api"
 
-  // Primario (rápido, pensado para punto)
-  private hourlyDataset =
-    process.env.CDS_ERA5_DATASET || "reanalysis-era5-single-levels-timeseries"
-
-  // Fallback (dataset clásico)
-  private hourlyFallbackDataset =
-    process.env.CDS_ERA5_FALLBACK_DATASET || "reanalysis-era5-single-levels"
-
-  // Daily (histórico largo) si lo configuras más adelante
+  private hourlyDataset = process.env.CDS_ERA5_DATASET || "reanalysis-era5-single-levels-timeseries"
+  private hourlyFallbackDataset = process.env.CDS_ERA5_FALLBACK_DATASET || "reanalysis-era5-single-levels"
   private dailyDataset = process.env.CDS_ERA5_DAILY_DATASET || ""
 
-  // Token (PAT) CDS
   private apiKey = process.env.COPERNICUS_API_KEY || ""
 
   private cdsHeaders(): Record<string, string> {
     if (!this.apiKey) return {}
-    // CDS REST funciona con PRIVATE-TOKEN
     return {
       "PRIVATE-TOKEN": this.apiKey,
       Accept: "application/json",
@@ -284,6 +322,12 @@ export class Era5Service {
     try {
       if (!this.apiKey) {
         return { success: false, error: "Falta COPERNICUS_API_KEY (token CDS) en el servidor", source: "ERA5" }
+      }
+      if (!request.startDate || !request.endDate) {
+        return { success: false, error: "Faltan fechas (startDate/endDate)", source: "ERA5" }
+      }
+      if (typeof request.latitude !== "number" || typeof request.longitude !== "number") {
+        return { success: false, error: "Faltan coordenadas (latitude/longitude)", source: "ERA5" }
       }
 
       const start = new Date(request.startDate)
@@ -300,11 +344,6 @@ export class Era5Service {
     }
   }
 
-  // ============================================================
-  // CDS Retrieve API v1 helpers
-  // POST  {base}/retrieve/v1/processes/{processId}/execution
-  // GET   {base}/retrieve/v1/jobs/{jobId}
-  // ============================================================
   private async submitJob(processId: string, inputs: any): Promise<string> {
     const url = `${this.cdsBaseUrl}/retrieve/v1/processes/${processId}/execution`
 
@@ -320,7 +359,6 @@ export class Era5Service {
     const txt = await res.text().catch(() => "")
     if (!res.ok) throw new Error(`CDS submit error ${res.status}: ${txt}`)
 
-    // 1) Location header suele traer .../jobs/{id}
     const loc = res.headers.get("location")
     if (loc) {
       const parts = loc.split("/").filter(Boolean)
@@ -328,7 +366,6 @@ export class Era5Service {
       if (maybeId) return maybeId
     }
 
-    // 2) body
     const body: any = txt ? JSON.parse(txt) : {}
     const jobId = body?.jobID || body?.jobId || body?.id
     if (!jobId) throw new Error(`CDS: no JobID en respuesta: ${txt}`)
@@ -346,8 +383,6 @@ export class Era5Service {
       const body: any = txt ? JSON.parse(txt) : {}
       const status = String(body?.status || body?.state || "").toLowerCase()
 
-      // ✅ lo más estándar en este API:
-      // outputs.asset.value.href
       const href =
         body?.outputs?.asset?.value?.href ||
         body?.outputs?.[0]?.value?.href ||
@@ -384,7 +419,6 @@ export class Era5Service {
     const dlUrl = await this.pollJob(jobId)
     const txt = await this.downloadText(dlUrl)
 
-    // si por lo que sea te devolviese JSON/asset, lo detectamos:
     if (txt.trim().startsWith("{") || txt.trim().startsWith("[")) {
       throw new Error(`CDS devolvió JSON en vez de CSV (revisa data_format). Respuesta: ${txt.slice(0, 300)}`)
     }
@@ -394,14 +428,9 @@ export class Era5Service {
     return txt
   }
 
-  // ============================================================
-  // HOURLY (<= 2 años)
-  // - timeseries (location) -> CSV
-  // - fallback single-levels (area) -> CSV
-  // ============================================================
   private async getClimateDataHourly(request: ClimateRequest): Promise<ApiResponse<ClimateData[]>> {
-    const start = new Date(request.startDate)
-    const end = new Date(request.endDate)
+    const start = new Date(request.startDate!)
+    const end = new Date(request.endDate!)
 
     const days: string[] = []
     const months: string[] = []
@@ -416,8 +445,6 @@ export class Era5Service {
     let csv: string | null = null
     let lastErr: any = null
 
-    // ---------- 1) timeseries (punto) ----------
-    // 👇 clave: data_format="csv"
     const inputsTimeseries = {
       variable: [
         "2m_temperature",
@@ -432,7 +459,6 @@ export class Era5Service {
       day: uniqSorted(days),
       time: times,
       data_format: "csv",
-      // el process lo soporta aunque no salga en el recorte del schema
       location: { latitude: request.latitude, longitude: request.longitude },
       product_type: "reanalysis",
     }
@@ -444,14 +470,13 @@ export class Era5Service {
       csv = null
     }
 
-    // ---------- 2) fallback single-levels (area) ----------
     if (!csv) {
       const pad = 0.125
       const area = [
-        request.latitude + pad, // N
-        request.longitude - pad, // W
-        request.latitude - pad, // S
-        request.longitude + pad, // E
+        (request.latitude as number) + pad, // N
+        (request.longitude as number) - pad, // W
+        (request.latitude as number) - pad, // S
+        (request.longitude as number) + pad, // E
       ]
 
       const inputsSingleLevels = {
@@ -469,8 +494,8 @@ export class Era5Service {
         day: uniqSorted(days),
         time: times,
         area,
-        data_format: "csv",          // ✅ esto evita GRIB
-        download_format: "unarchived" // ✅ si lo soporta el proceso
+        data_format: "csv",
+        download_format: "unarchived",
       }
 
       try {
@@ -482,7 +507,6 @@ export class Era5Service {
       }
     }
 
-    // ✅ aquí ya usas TU parser robusto
     const { header, rows } = parseCsv(csv)
 
     const iTime = idxOf(header, ["time", "valid_time", "date", "datetime"])
@@ -509,7 +533,7 @@ export class Era5Service {
       wsSum: number
       wsN: number
       frostH: number
-      utah: number
+      chillH: number
       heatDH: number
     }
 
@@ -545,7 +569,7 @@ export class Era5Service {
           wsSum: 0,
           wsN: 0,
           frostH: 0,
-          utah: 0,
+          chillH: 0,
           heatDH: 0,
         }
       }
@@ -571,8 +595,11 @@ export class Era5Service {
         a.wsN += 1
       }
 
-      if (Tc < 0) a.frostH += 1
-      a.utah += utahHourlyUnits(Tc)
+      // ✅ Horas reales
+      if (Tc < FROST_THRESHOLD_C) a.frostH += 1
+      if (Tc < CHILL_THRESHOLD_C) a.chillH += 1
+
+      // ✅ Heat degree-hours (base 7)
       a.heatDH += dynamicHeatHourlyDH(Tc, DYNAMIC_BASE_C)
     }
 
@@ -583,6 +610,8 @@ export class Era5Service {
         const tavg = a.n ? a.tsum / a.n : 0
         const rh = a.rhN ? a.rhSum / a.rhN : 0
         const ws = a.wsN ? a.wsSum / a.wsN : 0
+
+        // ✅ Convertimos DH -> DD por día
         const heatDD = a.heatDH / 24
 
         return {
@@ -597,7 +626,7 @@ export class Era5Service {
           eto: 0,
           etc: 0,
           frost_hours: a.frostH,
-          chill_hours: Number(a.utah.toFixed(2)),
+          chill_hours: a.chillH,
           gdd: Number(heatDD.toFixed(2)),
           computedChillHeat: true,
           computedFromHourly: true,
@@ -607,9 +636,6 @@ export class Era5Service {
     return { success: true, data: out, source: "ERA5" }
   }
 
-  // ============================================================
-  // DAILY (>2 años)
-  // ============================================================
   private async getClimateDataDaily(_request: ClimateRequest): Promise<ApiResponse<ClimateData[]>> {
     if (!this.dailyDataset) {
       return {
@@ -623,31 +649,29 @@ export class Era5Service {
   }
 }
 
-
 // --------------------
-// Main Weather Servicea
+// Main Weather Service
 // --------------------
 export class WeatherService {
   private nasaPower = new NasaPowerService()
   private era5 = new Era5Service()
   private aemet: AemetService
   private siar: SiarService
+  private openMeteo: OpenMeteoService
   private calculator = new ClimateCalculator()
 
- constructor(origin: string) {
-  const internalBase =
-    process.env.INTERNAL_BASE_URL ||
-    process.env.NEXT_INTERNAL_BASE_URL ||
-    origin
+  constructor(origin: string) {
+    const internalBase = process.env.INTERNAL_BASE_URL || process.env.NEXT_INTERNAL_BASE_URL || origin
 
-  this.aemet = new AemetService(internalBase)
-  this.siar = new SiarService(internalBase)
-}
-
+    this.aemet = new AemetService(internalBase)
+    this.siar = new SiarService(internalBase)
+    this.openMeteo = new OpenMeteoService(internalBase)
+  }
 
   async getClimateDataBySource(request: ClimateRequest): Promise<ApiResponse<ClimateData[]>> {
     const processData = (response: ApiResponse<ClimateData[]>) => {
       if (response.success && response.data) {
+        // latitude puede ser undefined en fuentes tipo AEMET CP; lo pasamos seguro
         return { ...response, data: this.calculator.processClimateData(response.data, request.latitude) }
       }
       return response
@@ -662,6 +686,8 @@ export class WeatherService {
         return processData(await this.aemet.getClimateData(request))
       case "SIAR":
         return processData(await this.siar.getClimateData(request))
+      case "OPEN_METEO":
+        return processData(await this.openMeteo.getClimateData(request))
       default:
         return { success: false, error: `Invalid source: ${String(request.source)}`, source: "API" }
     }

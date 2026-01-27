@@ -1,5 +1,5 @@
-// Configuración de fuentes de datos disponibles
-export type DataSource = "siar" | "aemet" | "nasa" | "era5" | "all"
+// lib/data-sources.ts
+import type { DataSource } from "./types"
 
 export interface DataSourceConfig {
   id: DataSource
@@ -10,70 +10,86 @@ export interface DataSourceConfig {
   resolution: string
   coverage: string
   enabled: boolean
+
+  // flags para UI
+  supportsCoordinates?: boolean
+  supportsPostalCode?: boolean
+  supportsDaily?: boolean
+  supportsHourly?: boolean
+  supportsHistoric20y?: boolean
 }
 
 export const DATA_SOURCES: DataSourceConfig[] = [
   {
-    id: "siar",
+    id: "SIAR",
     name: "SIAR",
     description: "Red de estaciones agrometeorológicas de España",
     database: "siar",
     features: ["Temperatura", "Humedad", "ETo", "Humedad del Suelo", "Temperatura del Suelo"],
     resolution: "Horaria",
     coverage: "España",
-    enabled: true,
+    enabled: false,
+    supportsCoordinates: true,
+    supportsHourly: true,
   },
   {
-    id: "aemet",
+    id: "AEMET",
     name: "AEMET",
-    description: "Agencia Estatal de Meteorología de España",
-    database: "PowerNasa", // Using PowerNasa structure for now
-    features: ["Temperatura", "Precipitación", "Viento", "Presión", "Humedad"],
-    resolution: "Horaria",
+    description: "Agencia Estatal de Meteorología de España (previsión)",
+    database: "aemet",
+    features: ["Temperatura", "Precipitación", "Viento", "Humedad"],
+    resolution: "Diaria",
     coverage: "España",
     enabled: true,
+    supportsPostalCode: true,
+    supportsDaily: true,
   },
   {
-    id: "nasa",
+    id: "NASA_POWER",
     name: "NASA POWER",
-    description: "Datos globales de NASA con alta precisión",
+    description: "Datos globales de NASA",
     database: "PowerNasa",
     features: ["Temperatura", "Radiación Solar", "Precipitación", "Viento", "Evapotranspiración"],
-    resolution: "Horaria / Diaria",
+    resolution: "Diaria",
     coverage: "Global",
     enabled: true,
+    supportsCoordinates: true,
+    supportsDaily: true,
+    supportsHistoric20y: true,
   },
   {
-    id: "era5",
+    id: "OPEN_METEO",
+    name: "OPEN METEO",
+    description: "Open-Meteo Archive (histórico global). Similar a NASA POWER.",
+    database: "open_meteo",
+    features: ["Temperatura", "Precipitación", "ETo FAO-56"],
+    resolution: "Diaria / Horaria",
+    coverage: "Global",
+    enabled: true,
+    supportsCoordinates: true,
+    supportsDaily: true,
+    supportsHourly: true,
+    supportsHistoric20y: true,
+  },
+  {
+    id: "ERA5",
     name: "ERA5",
-    description: "Reanálisis climático de alta resolución de Copernicus",
+    description: "Reanálisis Copernicus (alta resolución)",
     database: "era5",
-    features: ["Temperatura", "Presión", "Humedad", "Viento", "Radiación", "Nubosidad"],
+    features: ["Temperatura", "Presión", "Humedad", "Viento", "Radiación"],
     resolution: "Horaria",
     coverage: "Global",
-    enabled: true,
-  },
-  {
-    id: "all",
-    name: "Todas las Fuentes",
-    description: "Combinar datos de todas las fuentes disponibles",
-    database: "public",
-    features: ["Todos los parámetros disponibles"],
-    resolution: "Variable",
-    coverage: "Según disponibilidad",
-    enabled: true,
+    enabled: false,
+    supportsCoordinates: true,
+    supportsHourly: true,
+    supportsHistoric20y: true,
   },
 ]
 
-export function getDataSourceConfig(sourceId: DataSource): DataSourceConfig | undefined {
-  return DATA_SOURCES.find((source) => source.id === sourceId)
+export function getDataSourceConfig(sourceId: DataSource) {
+  return DATA_SOURCES.find((s) => s.id === sourceId)
 }
 
-export function getEnabledDataSources(): DataSourceConfig[] {
-  return DATA_SOURCES.filter((source) => source.enabled && source.id !== "all")
-}
-
-export function getDatabaseName(sourceId: DataSource): string {
-  const config = getDataSourceConfig(sourceId)
-  return config?.database || "PowerNasa"
+export function getEnabledDataSources() {
+  return DATA_SOURCES.filter((s) => s.enabled)
 }

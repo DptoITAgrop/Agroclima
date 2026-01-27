@@ -8,7 +8,7 @@ export interface PistachioParameters {
   kcLate: number
 
   // Temperature thresholds
-  baseTemperature: number // Base temperature for GDD (10°C pistachio)
+  baseTemperature: number // Base temperature for GDD (legacy)
   frostThreshold: number // 0°C
   chillThreshold: number // 7.2°C (simple model)
 
@@ -24,9 +24,14 @@ export const DEFAULT_PISTACHIO_PARAMS: PistachioParameters = {
   kcDevelopment: 0.75,
   kcMid: 1.1,
   kcLate: 0.85,
+
+  // ⚠️ Mantenemos este campo para compatibilidad,
+  // pero en esta app vamos a usar base 7°C para consistencia con ERA5/NASA.
   baseTemperature: 10,
+
   frostThreshold: 0,
   chillThreshold: 7.2,
+
   budBreak: 90,
   flowering: 120,
   fruitDevelopment: 180,
@@ -49,6 +54,9 @@ type SeasonalSummary = {
 export class ClimateCalculator {
   private params: PistachioParameters
 
+  // ✅ Consistencia con el resto del proyecto (tu motor usa base 7)
+  private readonly gddBaseC = 7
+
   constructor(params: PistachioParameters = DEFAULT_PISTACHIO_PARAMS) {
     this.params = params
   }
@@ -60,6 +68,9 @@ export class ClimateCalculator {
   /**
    * Reference Evapotranspiration (ETO) - Hargreaves-Samani (simplified)
    * ETO = 0.0023 * (Tmean + 17.8) * sqrt(Tmax - Tmin) * Ra
+   *
+   * Nota: Ra (MJ/m²/day) -> fórmula original asume Ra en MJ/m²/day.
+   * Si tu solar_radiation no está en MJ, NO lo uses aquí (ahora no lo usamos).
    */
   calculateETO(
     tempMax: number,
@@ -120,20 +131,19 @@ export class ClimateCalculator {
   }
 
   /**
-   * GDD simple (baseTemperature)
-   * OJO: si viene de ERA5/NASA con computedChillHeat=true, NO recalculamos.
+   * GDD simple (base 7°C para consistencia con el resto de la app)
+   * - Si computedChillHeat === true, normalmente ya viene base 7 => no recalculamos.
    */
   calculateGDD(tempMax: number, tempMin: number): number {
     const tempMean = (tempMax + tempMin) / 2
-    return Math.max(0, tempMean - this.params.baseTemperature)
+    return Math.max(0, tempMean - this.gddBaseC)
   }
 
   /**
-   * Chill hours simple (lineal bajo umbral)
-   * OJO: si viene de ERA5/NASA con computedChillHeat=true, NO recalculamos.
+   * Chill hours simple (lineal bajo umbral 7.2°C)
+   * - Solo útil si NO tienes hourly real.
    */
   calculateChillHours(tempMax: number, tempMin: number): number {
-    // defensivo: evita divisiones raras
     const tmax = Number.isFinite(tempMax) ? tempMax : 0
     const tmin = Number.isFinite(tempMin) ? tempMin : 0
 
@@ -148,8 +158,7 @@ export class ClimateCalculator {
   }
 
   /**
-   * Frost hours simple (lineal bajo 0)
-   * OJO: si viene de ERA5 horario, frost_hours ya es real y no se recalcula.
+   * Frost hours simple (lineal bajo 0°C)
    */
   calculateFrostHours(tempMax: number, tempMin: number): number {
     const tmax = Number.isFinite(tempMax) ? tempMax : 0
@@ -196,15 +205,31 @@ export class ClimateCalculator {
   }
 
   /**
-   * Procesa data diaria y añade ETO/ETC SIEMPRE.
-   * - Si computedChillHeat === true -> respeta gdd/chill_hours/frost_hours que vengan (ERA5/NASA)
-   * - Si computedChillHeat !== true -> calcula gdd/chill/frost con el método simple
-   *
-   * ✅ REGLA CLAVE (HF):
-   * - Fuera de Nov–Feb => chill_hours = 0
-   * - Nunca negativos => clamp a 0
+   * Sanity check físico para ETo/ETc DIARIA.
+   * - Valores diarios típicos: 0–10 mm/día. > 20 casi seguro está escalado/incorrecto.
+   * - Si llega algo absurdo, lo limitamos a un máximo razonable para no romper el déficit.
    */
-  processClimateData(data: ClimateData[], latitude: number): ClimateData[] {
+  private sanitizeDailyET(value: number): number {
+    const v = this.safeNum(value, 0)
+    if (v <= 0) return 0
+    // Si por alguna fuente viene en escala rara (p.ej. acumulado o mal convertido), cap defensivo
+    if (v > 20) return 20
+    return v
+  }
+
+  /**
+   * Procesa data diaria y añade ETO/ETC siempre que falten.
+   *
+   * Reglas:
+   * - Si day.eto y day.etc ya vienen > 0, se respetan (pero se sanitizan).
+   * - Si NO vienen, se calculan con Hargreaves + Kc.
+   * - Si computedChillHeat === true -> respeta gdd/chill_hours/frost_hours.
+   * - Si computedChillHeat !== true -> calcula gdd/chill/frost con el método simple.
+   *
+   * ✅ HF:
+   * - Fuera de Nov–Feb => chill_hours = 0
+   */
+  processClimateData(data: ClimateData[], latitude?: number): ClimateData[] {
     return data.map((day) => {
       const dayOfYear = this.getDayOfYear(day.date)
 
@@ -214,13 +239,22 @@ export class ClimateCalculator {
       const ws = this.safeNum(day.wind_speed)
       const sr = this.safeNum(day.solar_radiation)
 
-      const eto = this.calculateETO(tmax, tmin, hum, ws, sr, latitude, dayOfYear)
-      const etc = this.calculateETC(eto, dayOfYear)
+      // ✅ lat defensivo (AEMET por CP puede venir sin lat)
+      const latSafe = typeof latitude === "number" && Number.isFinite(latitude) ? latitude : 0
+
+      // 1) ETo/ETc: si vienen de la fuente, respétalos. Si no, calcula.
+      const incomingEto = this.sanitizeDailyET(this.safeNum((day as any).eto, 0))
+      const incomingEtc = this.sanitizeDailyET(this.safeNum((day as any).etc, 0))
+
+      const etoComputed = this.sanitizeDailyET(this.calculateETO(tmax, tmin, hum, ws, sr, latSafe, dayOfYear))
+      const etcComputed = this.sanitizeDailyET(this.calculateETC(etoComputed, dayOfYear))
+
+      const eto = incomingEto > 0 ? incomingEto : etoComputed
+      const etc = incomingEtc > 0 ? incomingEtc : etcComputed
 
       const inChillWindow = this.isInChillWindow(day.date)
 
-      // ✅ Si ya viene calculado (ERA5 horario o NASA UTAH/base7), NO recalcular…
-      // …pero sí CAPAR fuera de ventana y clamping a 0 para evitar negativos.
+      // 2) Si ya viene calculado (ERA5/NASA), NO recalcular índices térmicos
       if ((day as any).computedChillHeat) {
         const incomingChill = this.clamp0(this.safeNum((day as any).chill_hours))
         const incomingFrost = this.clamp0(this.safeNum((day as any).frost_hours))
@@ -236,7 +270,7 @@ export class ClimateCalculator {
         }
       }
 
-      // ✅ Caso fuentes sin cálculo (AEMET/SIAR o datasets diarios simples)
+      // 3) Caso fuentes sin cálculo
       const gdd = this.calculateGDD(tmax, tmin)
 
       const chillRaw = this.calculateChillHours(tmax, tmin)
@@ -246,8 +280,8 @@ export class ClimateCalculator {
 
       return {
         ...day,
-        eto: Number.parseFloat(eto.toFixed(2)),
-        etc: Number.parseFloat(etc.toFixed(2)),
+        eto: Number.parseFloat(this.clamp0(eto).toFixed(2)),
+        etc: Number.parseFloat(this.clamp0(etc).toFixed(2)),
         gdd: Number.parseFloat(this.clamp0(gdd).toFixed(1)),
         chill_hours: Number.parseFloat(this.clamp0(chill).toFixed(1)),
         frost_hours: Number.parseFloat(this.clamp0(frost).toFixed(1)),
@@ -264,7 +298,6 @@ export class ClimateCalculator {
 
     const totalGDD = data.reduce((sum, day) => sum + this.clamp0(this.safeNum((day as any).gdd)), 0)
 
-    // ✅ HF: solo Nov–Feb + clamp0
     const totalChillHours = data.reduce((sum, day) => {
       if (!this.isInChillWindow(day.date)) return sum
       return sum + this.clamp0(this.safeNum((day as any).chill_hours))
@@ -276,8 +309,9 @@ export class ClimateCalculator {
     const totalPrecipitation = data.reduce((sum, day) => sum + this.clamp0(this.safeNum((day as any).precipitation)), 0)
 
     const frostDays = data.filter((day) => this.clamp0(this.safeNum((day as any).frost_hours)) > 0).length
-    const avgTemperature =
-      data.reduce((sum, day) => sum + this.safeNum((day as any).temperature_avg), 0) / totalDays
+    const avgTemperature = data.reduce((sum, day) => sum + this.safeNum((day as any).temperature_avg), 0) / totalDays
+
+    const deficit = Math.max(0, totalETC - totalPrecipitation)
 
     return {
       totalDays: data.length,
@@ -289,7 +323,7 @@ export class ClimateCalculator {
       totalETO: Number.parseFloat(totalETO.toFixed(1)),
       totalETC: Number.parseFloat(totalETC.toFixed(1)),
       totalPrecipitation: Number.parseFloat(totalPrecipitation.toFixed(1)),
-      waterDeficit: Number.parseFloat((totalETC - totalPrecipitation).toFixed(1)),
+      waterDeficit: Number.parseFloat(deficit.toFixed(1)),
     }
   }
 
@@ -309,8 +343,9 @@ export class ClimateCalculator {
     // Heat units / GDD
     if (seasonalSummary.totalGDD < 1500) {
       warnings.push("Insuficientes grados día para completar el ciclo del pistacho")
-    } else if (seasonalSummary.totalGDD > 3000) {
-      warnings.push("Exceso de calor puede afectar la calidad del fruto")
+    } else if (seasonalSummary.totalGDD > 3200) {
+      // ✅ ligeramente más permisivo: exceso de GDD rara vez limita; el problema real es estrés térmico + agua
+      warnings.push("Calor acumulado alto: vigilar estrés térmico y riego en verano")
     } else {
       recommendations.push("Acumulación térmica adecuada")
     }
@@ -321,8 +356,8 @@ export class ClimateCalculator {
     }
 
     // Water deficit
-    if (seasonalSummary.waterDeficit > 500) {
-      recommendations.push(`Déficit hídrico de ${seasonalSummary.waterDeficit}mm requiere riego suplementario`)
+    if (seasonalSummary.waterDeficit > 300) {
+      recommendations.push(`Déficit hídrico de ${seasonalSummary.waterDeficit}mm: requiere riego suplementario`)
     }
 
     return {
@@ -336,9 +371,13 @@ export class ClimateCalculator {
     let score = 100
 
     if (summary.totalChillHours < 600 || summary.totalChillHours > 1500) score -= 30
-    if (summary.totalGDD < 1500 || summary.totalGDD > 3000) score -= 25
+    if (summary.totalGDD < 1500) score -= 25
+
+    // ✅ no penalizar fuerte por "exceso de GDD"
+    if (summary.totalGDD > 3400) score -= 8
+
     if (summary.frostDays > 10) score -= summary.frostDays * 2
-    if (summary.waterDeficit > 500) score -= Math.min(20, (summary.waterDeficit - 500) / 50)
+    if (summary.waterDeficit > 500) score -= Math.min(25, (summary.waterDeficit - 500) / 40)
 
     return Math.max(0, Math.min(100, Math.round(score)))
   }
@@ -464,7 +503,9 @@ export class ClimateCalculator {
       )
       recommendations.push("Aumentar frecuencia de riego en verano debido al incremento de temperaturas")
     } else if (historicalTrends.temperatureTrend < -0.1) {
-      recommendations.push(`Tendencia al enfriamiento (${historicalTrends.temperatureTrend}°C/año): Protección contra heladas tardías`)
+      recommendations.push(
+        `Tendencia al enfriamiento (${historicalTrends.temperatureTrend}°C/año): Protección contra heladas tardías`,
+      )
     }
 
     if (historicalTrends.precipitationTrend < -5) {
@@ -473,7 +514,9 @@ export class ClimateCalculator {
       )
       recommendations.push("Implementar riego por goteo y mulching para conservar humedad")
     } else if (historicalTrends.precipitationTrend > 5) {
-      recommendations.push(`Tendencia a mayor precipitación (+${historicalTrends.precipitationTrend}mm/año): Mejorar drenaje del suelo`)
+      recommendations.push(
+        `Tendencia a mayor precipitación (+${historicalTrends.precipitationTrend}mm/año): Mejorar drenaje del suelo`,
+      )
     }
 
     if (historicalTrends.chillHoursTrend < -10) {
