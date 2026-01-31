@@ -11,7 +11,7 @@ import { VarietyRecommendationEngine, type VarietyRecommendation } from "@/lib/v
 import type { ClimateData } from "@/lib/types"
 import Image from "next/image"
 
-// ✅ NUEVO: normalización + stats seguras
+// ✅ normalización + stats seguras
 import { normalizeClimateData } from "@/lib/climate-normalize"
 import { getYearCount, safeAvg, safeMin, safeMax } from "@/lib/climate-stats"
 
@@ -36,6 +36,52 @@ type ClimateProfileForReport = {
   extremeColdDays: number
 }
 
+/** =========================
+ * Ventanas / campañas
+ * ========================= */
+function parseISODate(s: string): Date {
+  const d = new Date(s)
+  if (Number.isNaN(d.getTime())) return new Date("1970-01-01")
+  return d
+}
+
+function month1to12(d: Date) {
+  return d.getMonth() + 1
+}
+
+// Nov/Dic 2023 -> campaña 2024, Ene/Feb 2024 -> campaña 2024
+function winterCampaignYear(d: Date): number {
+  const y = d.getFullYear()
+  const m = month1to12(d)
+  return m >= 11 ? y + 1 : y
+}
+
+function isWinterChill(d: Date): boolean {
+  const m = month1to12(d)
+  return m === 11 || m === 12 || m === 1 || m === 2
+}
+
+function isGddSeason(d: Date): boolean {
+  const m = month1to12(d)
+  // ✅ NUEVO: GDD del 1 abril al 31 octubre
+  return m >= 4 && m <= 10
+}
+
+function isSpringFrostWindow(d: Date): boolean {
+  const m = month1to12(d)
+  return m === 3 || m === 4
+}
+
+function isSummer(d: Date): boolean {
+  const m = month1to12(d)
+  return m >= 6 && m <= 8
+}
+
+function mean(values: number[]) {
+  if (!values.length) return 0
+  return values.reduce((a, b) => a + b, 0) / values.length
+}
+
 export function VarietyRecommendationDashboard({ climateData, location, onBack }: VarietyRecommendationDashboardProps) {
   const [recommendations, setRecommendations] = useState<VarietyRecommendation[]>([])
   const [detailedReport, setDetailedReport] = useState<any>(null)
@@ -56,24 +102,121 @@ export function VarietyRecommendationDashboard({ climateData, location, onBack }
         // ✅ Recomendaciones sobre datos normalizados
         const varietyRecommendations = engine.recommendVarieties(normalized, location)
 
-        // ✅ Perfil climático robusto (sin NaN/undefined y sin dividir fijo por 20)
+        /**
+         * ✅ Perfil climático para el REPORTE (UI):
+         * - Aquí devolvemos valores ANUALES (promedio por campaña/año)
+         * - y alineados con ventanas:
+         *   - Chill: Nov–Feb (campaña invierno)
+         *   - GDD: Abr–Oct (pedido)
+         *   - Frost: Mar–Abr
+         *   - Déficit: Abr–Oct
+         *   - Heat stress: Jun–Aug
+         *   - Extreme cold: Nov–Feb (campaña invierno)
+         */
+        const winterMap = new Map<number, { chill: number; extremeColdDays: number }>()
+        const gddMap = new Map<number, { gdd: number; seasonEtc: number; seasonP: number }>()
+        const springMap = new Map<number, { frostHours: number; frostDays: number }>()
+        const precipByYear = new Map<number, number>()
+        const heatByYear = new Map<number, number>()
+
+        for (const day of normalized) {
+          const d = parseISODate(day.date)
+          const y = d.getFullYear()
+
+          // Precip anual por año natural
+          precipByYear.set(y, (precipByYear.get(y) ?? 0) + (day.precipitation ?? 0))
+
+          // Chill invierno por campaña
+          if (isWinterChill(d)) {
+            const cy = winterCampaignYear(d)
+            const prev = winterMap.get(cy) ?? { chill: 0, extremeColdDays: 0 }
+            prev.chill += day.chill_hours ?? 0
+            if ((day.temperature_min ?? 999) < -5) prev.extremeColdDays += 1
+            winterMap.set(cy, prev)
+          }
+
+          // GDD + déficit temporada (Abr–Oct) por año natural
+          if (isGddSeason(d)) {
+            const prev = gddMap.get(y) ?? { gdd: 0, seasonEtc: 0, seasonP: 0 }
+            prev.gdd += day.gdd ?? 0
+            prev.seasonEtc += day.etc ?? 0
+            prev.seasonP += day.precipitation ?? 0
+            gddMap.set(y, prev)
+          }
+
+          // Heladas floración (Mar–Abr) por año natural
+          if (isSpringFrostWindow(d)) {
+            const prev = springMap.get(y) ?? { frostHours: 0, frostDays: 0 }
+            const fh = day.frost_hours ?? 0
+            prev.frostHours += fh
+            if (fh > 0) prev.frostDays += 1
+            springMap.set(y, prev)
+          }
+
+          // Estrés térmico (Jun–Aug) por año natural
+          if (isSummer(d)) {
+            const prev = heatByYear.get(y) ?? 0
+            heatByYear.set(y, prev + ((day.temperature_max ?? -999) > 40 ? 1 : 0))
+          }
+        }
+
+        const winterYears = [...winterMap.keys()].sort((a, b) => a - b)
+        const gddYears = [...gddMap.keys()].sort((a, b) => a - b)
+        const springYears = [...springMap.keys()].sort((a, b) => a - b)
+        const precipYears = [...precipByYear.keys()].sort((a, b) => a - b)
+        const heatYears = [...heatByYear.keys()].sort((a, b) => a - b)
+
+        const annualChillAvg = mean(winterYears.map((y) => winterMap.get(y)!.chill))
+        const annualExtremeColdAvg = mean(winterYears.map((y) => winterMap.get(y)!.extremeColdDays))
+
+        const annualGddAvg = mean(gddYears.map((y) => gddMap.get(y)!.gdd))
+        const annualDeficitAvg = mean(
+          gddYears.map((y) => {
+            const a = gddMap.get(y)!
+            return Math.max(0, a.seasonEtc - a.seasonP)
+          }),
+        )
+
+        const annualSpringFrostHoursAvg = mean(springYears.map((y) => springMap.get(y)!.frostHours))
+        const annualSpringFrostDaysAvg = mean(springYears.map((y) => springMap.get(y)!.frostDays))
+
+        const annualPrecipAvg = mean(precipYears.map((y) => precipByYear.get(y)!))
+        const annualHeatStressAvg = mean(heatYears.map((y) => heatByYear.get(y)!))
+
+        // ✅ yearCount “real”: preferimos el del dataset, pero si por lo que sea está vacío, usamos el máximo de campañas detectadas
+        const yearCountFinal =
+          yearCount ??
+          Math.max(
+            1,
+            new Set(normalized.map((d) => parseISODate(d.date).getFullYear())).size,
+            winterYears.length,
+            gddYears.length,
+          )
+
         const climateProfile: ClimateProfileForReport = {
-          yearCount,
+          yearCount: yearCountFinal,
 
           avgTemperature: safeAvg(normalized.map((d) => d.temperature_avg)),
           minTemperature: safeMin(normalized.map((d) => d.temperature_min)),
           maxTemperature: safeMax(normalized.map((d) => d.temperature_max)),
 
-          totalChillHours: normalized.reduce((sum, day) => sum + day.chill_hours, 0),
-          totalFrostHours: normalized.reduce((sum, day) => sum + day.frost_hours, 0),
-          frostDays: normalized.filter((day) => day.frost_hours > 0).length,
+          // ✅ ya ANUAL (promedio por campaña/año)
+          totalChillHours: annualChillAvg,
+          totalGDD: annualGddAvg,
 
-          totalPrecipitation: normalized.reduce((sum, day) => sum + day.precipitation, 0),
-          waterDeficit: Math.max(0, normalized.reduce((sum, day) => sum + (day.etc - day.precipitation), 0)),
+          // ✅ heladas floración (Mar–Abr) anual
+          totalFrostHours: annualSpringFrostHoursAvg,
+          frostDays: annualSpringFrostDaysAvg,
 
-          totalGDD: normalized.reduce((sum, day) => sum + day.gdd, 0),
-          heatStressDays: normalized.filter((day) => day.temperature_max > 40).length,
-          extremeColdDays: normalized.filter((day) => day.temperature_min < -5).length,
+          // ✅ precip anual media
+          totalPrecipitation: annualPrecipAvg,
+
+          // ✅ déficit temporada Abr–Oct anual
+          waterDeficit: annualDeficitAvg,
+
+          // ✅ estrés / frío extremos anuales
+          heatStressDays: annualHeatStressAvg,
+          extremeColdDays: annualExtremeColdAvg,
         }
 
         const report = engine.generateDetailedReport(varietyRecommendations, climateProfile as any, location)
@@ -90,7 +233,6 @@ export function VarietyRecommendationDashboard({ climateData, location, onBack }
 
     if (normalized.length > 0) generateRecommendations()
     else {
-      // si no hay datos, no nos quedamos “loading” infinito
       setRecommendations([])
       setDetailedReport(null)
       setSelectedVariety(null)
@@ -143,11 +285,8 @@ export function VarietyRecommendationDashboard({ climateData, location, onBack }
     )
   }
 
-  // ✅ añoCount real (si engine no lo devuelve, lo sacamos del report o usamos el calculado)
-  const yCount =
-    detailedReport?.climateProfile?.yearCount ??
-    yearCount ??
-    1
+  // ✅ nº de campañas/años usados para promedios (ya viene en climateProfile)
+  const yCount = detailedReport?.climateProfile?.yearCount ?? yearCount ?? 1
 
   return (
     <div className="space-y-6">
@@ -196,6 +335,10 @@ export function VarietyRecommendationDashboard({ climateData, location, onBack }
                 <div className="text-sm text-muted-foreground">Nivel de Riesgo</div>
               </div>
             </div>
+
+            <div className="mt-3 text-xs text-muted-foreground">
+              Promedios calculados con <b>{yCount}</b> campañas/años.
+            </div>
           </CardContent>
         </Card>
       )}
@@ -214,9 +357,7 @@ export function VarietyRecommendationDashboard({ climateData, location, onBack }
               <Card
                 key={recommendation.variety.id}
                 className={`cursor-pointer transition-all ${
-                  selectedVariety?.variety.id === recommendation.variety.id
-                    ? "ring-2 ring-green-500 shadow-lg"
-                    : "hover:shadow-md"
+                  selectedVariety?.variety.id === recommendation.variety.id ? "ring-2 ring-green-500 shadow-lg" : "hover:shadow-md"
                 }`}
                 onClick={() => setSelectedVariety(recommendation)}
               >
@@ -231,16 +372,10 @@ export function VarietyRecommendationDashboard({ climateData, location, onBack }
                       <p className="text-sm text-muted-foreground mb-3">{recommendation.variety.description}</p>
                     </div>
                     <div className="text-right">
-                      <div
-                        className={`text-2xl font-bold px-3 py-1 rounded-lg ${getSuitabilityColor(
-                          recommendation.suitabilityScore,
-                        )}`}
-                      >
+                      <div className={`text-2xl font-bold px-3 py-1 rounded-lg ${getSuitabilityColor(recommendation.suitabilityScore)}`}>
                         {recommendation.suitabilityScore.toFixed(0)}%
                       </div>
-                      <div className="text-xs text-muted-foreground mt-1">
-                        {getSuitabilityLabel(recommendation.suitabilityScore)}
-                      </div>
+                      <div className="text-xs text-muted-foreground mt-1">{getSuitabilityLabel(recommendation.suitabilityScore)}</div>
                     </div>
                   </div>
 
@@ -282,18 +417,14 @@ export function VarietyRecommendationDashboard({ climateData, location, onBack }
                   {recommendation.matchingFactors.length > 0 && (
                     <div className="mb-3">
                       <div className="text-sm font-medium text-green-600 mb-1">✓ Factores favorables:</div>
-                      <div className="text-xs text-muted-foreground">
-                        {recommendation.matchingFactors.slice(0, 2).join(" • ")}
-                      </div>
+                      <div className="text-xs text-muted-foreground">{recommendation.matchingFactors.slice(0, 2).join(" • ")}</div>
                     </div>
                   )}
 
                   {recommendation.concerns.length > 0 && (
                     <div className="mb-3">
                       <div className="text-sm font-medium text-orange-600 mb-1">⚠ Consideraciones:</div>
-                      <div className="text-xs text-muted-foreground">
-                        {recommendation.concerns.slice(0, 2).join(" • ")}
-                      </div>
+                      <div className="text-xs text-muted-foreground">{recommendation.concerns.slice(0, 2).join(" • ")}</div>
                     </div>
                   )}
 
@@ -321,8 +452,11 @@ export function VarietyRecommendationDashboard({ climateData, location, onBack }
               <Card>
                 <CardHeader>
                   <CardTitle>Perfil Climático de la Ubicación</CardTitle>
-                  <CardDescription>Análisis de {normalized.length} días de datos históricos</CardDescription>
+                  <CardDescription>
+                    Valores promedio anual (ventanas agronómicas) con {yCount} campañas/años
+                  </CardDescription>
                 </CardHeader>
+
                 <CardContent>
                   <div className="grid grid-cols-2 md:grid-cols-3 gap-6">
                     <div className="space-y-2">
@@ -330,9 +464,7 @@ export function VarietyRecommendationDashboard({ climateData, location, onBack }
                         <Thermometer className="h-4 w-4 text-red-500" />
                         <span className="text-sm font-medium">Temperatura</span>
                       </div>
-                      <div className="text-2xl font-bold">
-                        {detailedReport.climateProfile.avgTemperature.toFixed(1)}°C
-                      </div>
+                      <div className="text-2xl font-bold">{detailedReport.climateProfile.avgTemperature.toFixed(1)}°C</div>
                       <div className="text-xs text-muted-foreground">
                         Rango: {detailedReport.climateProfile.minTemperature.toFixed(1)}°C a{" "}
                         {detailedReport.climateProfile.maxTemperature.toFixed(1)}°C
@@ -344,10 +476,19 @@ export function VarietyRecommendationDashboard({ climateData, location, onBack }
                         <Snowflake className="h-4 w-4 text-blue-500" />
                         <span className="text-sm font-medium">Horas Frío</span>
                       </div>
-                      <div className="text-2xl font-bold">
-                        {Math.round(detailedReport.climateProfile.totalChillHours / yCount)}
+                      {/* ✅ YA es anual (no dividir otra vez) */}
+                      <div className="text-2xl font-bold">{Math.round(detailedReport.climateProfile.totalChillHours)}h</div>
+                      <div className="text-xs text-muted-foreground">Promedio anual (Nov–Feb)</div>
+                    </div>
+
+                    <div className="space-y-2">
+                      <div className="flex items-center gap-2">
+                        <Sun className="h-4 w-4 text-yellow-500" />
+                        <span className="text-sm font-medium">GDD</span>
                       </div>
-                      <div className="text-xs text-muted-foreground">Promedio anual</div>
+                      {/* ✅ YA es anual (Abr–Oct) */}
+                      <div className="text-2xl font-bold">{Math.round(detailedReport.climateProfile.totalGDD)}</div>
+                      <div className="text-xs text-muted-foreground">Promedio anual (Abr–Oct)</div>
                     </div>
 
                     <div className="space-y-2">
@@ -355,9 +496,7 @@ export function VarietyRecommendationDashboard({ climateData, location, onBack }
                         <Droplets className="h-4 w-4 text-blue-500" />
                         <span className="text-sm font-medium">Precipitación</span>
                       </div>
-                      <div className="text-2xl font-bold">
-                        {Math.round(detailedReport.climateProfile.totalPrecipitation / yCount)}mm
-                      </div>
+                      <div className="text-2xl font-bold">{Math.round(detailedReport.climateProfile.totalPrecipitation)}mm</div>
                       <div className="text-xs text-muted-foreground">Promedio anual</div>
                     </div>
 
@@ -366,21 +505,9 @@ export function VarietyRecommendationDashboard({ climateData, location, onBack }
                         <AlertTriangle className="h-4 w-4 text-orange-500" />
                         <span className="text-sm font-medium">Días de Helada</span>
                       </div>
-                      <div className="text-2xl font-bold">
-                        {Math.round(detailedReport.climateProfile.frostDays / yCount)}
-                      </div>
-                      <div className="text-xs text-muted-foreground">Promedio anual</div>
-                    </div>
-
-                    <div className="space-y-2">
-                      <div className="flex items-center gap-2">
-                        <Sun className="h-4 w-4 text-yellow-500" />
-                        <span className="text-sm font-medium">Estrés Térmico</span>
-                      </div>
-                      <div className="text-2xl font-bold">
-                        {Math.round(detailedReport.climateProfile.heatStressDays / yCount)}
-                      </div>
-                      <div className="text-xs text-muted-foreground">Días &gt;40°C/año</div>
+                      {/* ✅ heladas Mar–Abr anual */}
+                      <div className="text-2xl font-bold">{Math.round(detailedReport.climateProfile.frostDays)}</div>
+                      <div className="text-xs text-muted-foreground">Promedio anual (Mar–Abr)</div>
                     </div>
 
                     <div className="space-y-2">
@@ -388,10 +515,27 @@ export function VarietyRecommendationDashboard({ climateData, location, onBack }
                         <Droplets className="h-4 w-4 text-red-500" />
                         <span className="text-sm font-medium">Déficit Hídrico</span>
                       </div>
-                      <div className="text-2xl font-bold">
-                        {Math.round(detailedReport.climateProfile.waterDeficit / yCount)}mm
+                      {/* ✅ déficit Abr–Oct anual */}
+                      <div className="text-2xl font-bold">{Math.round(detailedReport.climateProfile.waterDeficit)}mm</div>
+                      <div className="text-xs text-muted-foreground">Promedio anual (Abr–Oct)</div>
+                    </div>
+
+                    <div className="space-y-2">
+                      <div className="flex items-center gap-2">
+                        <Sun className="h-4 w-4 text-yellow-500" />
+                        <span className="text-sm font-medium">Estrés Térmico</span>
                       </div>
-                      <div className="text-xs text-muted-foreground">Promedio anual</div>
+                      <div className="text-2xl font-bold">{Math.round(detailedReport.climateProfile.heatStressDays)}</div>
+                      <div className="text-xs text-muted-foreground">Días &gt;40°C/año (Jun–Ago)</div>
+                    </div>
+
+                    <div className="space-y-2">
+                      <div className="flex items-center gap-2">
+                        <Snowflake className="h-4 w-4 text-blue-500" />
+                        <span className="text-sm font-medium">Frío Extremo</span>
+                      </div>
+                      <div className="text-2xl font-bold">{Math.round(detailedReport.climateProfile.extremeColdDays)}</div>
+                      <div className="text-xs text-muted-foreground">Días &lt; -5°C/año (Nov–Feb)</div>
                     </div>
                   </div>
                 </CardContent>

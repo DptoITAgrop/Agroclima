@@ -30,7 +30,12 @@ import { DetailedReport } from "./detailed-report"
 import { VarietyRecommendationDashboard } from "./variety-recommendation-dashboard"
 
 // ✅ Recalc dinámico del dashboard
-import { CHILL_SEASON_MONTHS, filterDailyData, recalcMetricsFromDaily } from "@/lib/dashboard-recalc"
+import {
+  CHILL_SEASON_MONTHS,
+  filterDailyData,
+  recalcMetricsFromDaily,
+  recalcHistoricalAveragesFromDaily,
+} from "@/lib/dashboard-recalc"
 
 type RequestInfo = {
   latitude: number
@@ -54,6 +59,46 @@ interface ClimateDashboardProps {
   }
   requestInfo: RequestInfo
   onBackToForm?: () => void
+}
+
+function clampNumber(n: unknown, fallback = 0) {
+  const v = typeof n === "number" ? n : Number(n)
+  return Number.isFinite(v) ? v : fallback
+}
+
+/**
+ * ✅ Score “dashboard” para que el índice NO dependa del total 20 años.
+ * Reglas alineadas con tu ClimateCalculator (pero usando valores medios anuales).
+ */
+function calculateSuitabilityScoreFromSummary(summary: {
+  chillHours: number
+  totalGDD: number
+  frostDays: number
+  waterDeficit: number
+}) {
+  let score = 100
+
+  // Chill hours (ideal 600-1500)
+  if (summary.chillHours < 600 || summary.chillHours > 1500) score -= 30
+
+  // GDD (Abr-Oct) ideal 1500-3000
+  if (summary.totalGDD < 1500) score -= 25
+  if (summary.totalGDD > 3400) score -= 8
+
+  // Frost days
+  if (summary.frostDays > 10) score -= summary.frostDays * 2
+
+  // Water deficit
+  if (summary.waterDeficit > 500) score -= Math.min(25, (summary.waterDeficit - 500) / 40)
+
+  return Math.max(0, Math.min(100, Math.round(score)))
+}
+
+function scoreLabel(score: number) {
+  if (score >= 80) return "Excelente"
+  if (score >= 60) return "Bueno"
+  if (score >= 40) return "Regular"
+  return "Inadecuado"
 }
 
 export function ClimateDashboard({ data, requestInfo, onBackToForm }: ClimateDashboardProps) {
@@ -83,47 +128,81 @@ export function ClimateDashboard({ data, requestInfo, onBackToForm }: ClimateDas
 
   console.log("[v0] Final climate data length:", climateData.length)
 
+  const isHistorical = Boolean(requestInfo?.isHistorical)
+
   // ==========================================================
   // ✅ DASHBOARD LIVE METRICS (recalculadas desde climateData)
+  //   - Normal: totales del periodo seleccionado
+  //   - Histórico: medias anuales (20 años)
   // ==========================================================
   const liveAllYear = useMemo(() => {
-    return recalcMetricsFromDaily(filterDailyData(climateData as any, { year: "all" }))
-  }, [climateData])
+    const all = filterDailyData(climateData as any, { year: "all" })
+    return isHistorical ? recalcHistoricalAveragesFromDaily(all as any) : recalcMetricsFromDaily(all as any)
+  }, [climateData, isHistorical])
 
   const liveChillSeason = useMemo(() => {
+    // En normal: filtramos Nov-Feb
+    // En histórico: lo calculamos por año y luego media anual (aquí filtramos por meses para que sea más “legible”)
     const chillSeasonDaily = filterDailyData(climateData as any, { year: "all", months: CHILL_SEASON_MONTHS })
-    return recalcMetricsFromDaily(chillSeasonDaily)
-  }, [climateData])
+    return isHistorical
+      ? recalcHistoricalAveragesFromDaily(chillSeasonDaily as any, { chillMonths: CHILL_SEASON_MONTHS })
+      : recalcMetricsFromDaily(chillSeasonDaily as any, { chillMonths: CHILL_SEASON_MONTHS })
+  }, [climateData, isHistorical])
 
   const comparisonMetrics = useMemo(() => {
     const all = liveAllYear?.summary
     const chill = liveChillSeason?.summary
     if (!all || !chill) return null
 
+    // En histórico, queremos “por año” implícito (media anual).
+    // En normal, son totales del rango seleccionado.
     return {
       chillHours: {
-        value: chill.chillHours,
+        value: clampNumber(chill.chillHours),
         optimal: { min: 600, max: 1500 },
         status:
-          chill.chillHours >= 600 && chill.chillHours <= 1500 ? "optimal" : chill.chillHours < 600 ? "low" : "high",
+          clampNumber(chill.chillHours) >= 600 && clampNumber(chill.chillHours) <= 1500
+            ? "optimal"
+            : clampNumber(chill.chillHours) < 600
+              ? "low"
+              : "high",
       },
       gdd: {
-        value: all.totalGDD,
+        value: clampNumber(all.totalGDD),
         optimal: { min: 1500, max: 3000 },
-        status: all.totalGDD >= 1500 && all.totalGDD <= 3000 ? "optimal" : all.totalGDD < 1500 ? "low" : "high",
+        status:
+          clampNumber(all.totalGDD) >= 1500 && clampNumber(all.totalGDD) <= 3000
+            ? "optimal"
+            : clampNumber(all.totalGDD) < 1500
+              ? "low"
+              : "high",
       },
       frostDays: {
-        value: all.frostDays,
+        value: clampNumber(all.frostDays),
         optimal: { min: 0, max: 10 },
-        status: all.frostDays <= 10 ? "optimal" : "high",
+        status: clampNumber(all.frostDays) <= 10 ? "optimal" : "high",
       },
       waterDeficit: {
-        value: all.waterDeficit,
+        value: clampNumber(all.waterDeficit),
         optimal: { min: 0, max: 500 },
-        status: all.waterDeficit <= 500 ? "optimal" : "high",
+        status: clampNumber(all.waterDeficit) <= 500 ? "optimal" : "high",
       },
     }
   }, [liveAllYear, liveChillSeason])
+
+  // ✅ Si es histórico, calculamos un score basado en MEDIAS anuales del dashboard.
+  // Si NO es histórico, dejamos el de primaryAnalysis (tu cálculo original).
+  const displayedSuitabilityScore = useMemo(() => {
+    if (!isHistorical) return clampNumber(primaryAnalysis?.suitability?.suitabilityScore, 0)
+    const s = liveAllYear?.summary
+    if (!s) return 0
+    return calculateSuitabilityScoreFromSummary({
+      chillHours: clampNumber(liveChillSeason?.summary?.chillHours, 0),
+      totalGDD: clampNumber(s.totalGDD, 0),
+      frostDays: clampNumber(s.frostDays, 0),
+      waterDeficit: clampNumber(s.waterDeficit, 0),
+    })
+  }, [isHistorical, primaryAnalysis, liveAllYear, liveChillSeason])
 
   const getStatusIcon = (status: string) => {
     switch (status) {
@@ -151,7 +230,7 @@ export function ClimateDashboard({ data, requestInfo, onBackToForm }: ClimateDas
     }
   }
 
-  // ✅ CAMBIO PEDIDO: helper para mostrar 2 decimales
+  // ✅ helper para mostrar 2 decimales
   const fmt2 = (v: unknown) => {
     const n = typeof v === "number" ? v : Number(v)
     return Number.isFinite(n) ? n.toFixed(2) : "0.00"
@@ -288,7 +367,7 @@ export function ClimateDashboard({ data, requestInfo, onBackToForm }: ClimateDas
 
                 {requestInfo.isHistorical && (
                   <Badge variant="secondary" className="text-xs">
-                    Análisis Histórico 20 años
+                    Análisis Histórico 20 años (medias anuales)
                   </Badge>
                 )}
               </div>
@@ -364,32 +443,29 @@ export function ClimateDashboard({ data, requestInfo, onBackToForm }: ClimateDas
                 <TrendingUp className="h-5 w-5 text-primary" />
                 Índice de Aptitud General
               </CardTitle>
+              {isHistorical && (
+                <CardDescription>
+                  Mostrando <strong>medias anuales</strong> del histórico (20 años), no el total acumulado.
+                </CardDescription>
+              )}
             </CardHeader>
             <CardContent>
               <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
                 <div className="space-y-4">
                   <div className="text-center">
-                    <div className="text-4xl font-bold text-primary mb-2">
-                      {primaryAnalysis?.suitability?.suitabilityScore?.toFixed?.(0) ?? "0"}%
-                    </div>
+                    <div className="text-4xl font-bold text-primary mb-2">{displayedSuitabilityScore.toFixed(0)}%</div>
                     <Badge
-                      variant={(primaryAnalysis?.suitability?.suitabilityScore ?? 0) >= 60 ? "default" : "destructive"}
+                      variant={displayedSuitabilityScore >= 60 ? "default" : "destructive"}
                       className="text-sm"
                     >
-                      {(primaryAnalysis?.suitability?.suitabilityScore ?? 0) >= 80
-                        ? "Excelente"
-                        : (primaryAnalysis?.suitability?.suitabilityScore ?? 0) >= 60
-                          ? "Bueno"
-                          : (primaryAnalysis?.suitability?.suitabilityScore ?? 0) >= 40
-                            ? "Regular"
-                            : "Inadecuado"}
+                      {scoreLabel(displayedSuitabilityScore)}
                     </Badge>
                   </div>
-                  <Progress value={primaryAnalysis?.suitability?.suitabilityScore ?? 0} className="h-3" />
+                  <Progress value={displayedSuitabilityScore} className="h-3" />
                 </div>
 
                 <div className="space-y-3">
-                  <h4 className="font-medium">Factores Clave:</h4>
+                  <h4 className="font-medium">Factores Clave{isHistorical ? " (media anual)" : ""}:</h4>
                   {comparisonMetrics && (
                     <div className="space-y-2">
                       <div className="flex items-center justify-between">
@@ -403,7 +479,7 @@ export function ClimateDashboard({ data, requestInfo, onBackToForm }: ClimateDas
                       </div>
 
                       <div className="flex items-center justify-between">
-                        <span className="text-sm">Grados Día</span>
+                        <span className="text-sm">Grados Día (Abr-Oct)</span>
                         <div className="flex items-center gap-2">
                           {getStatusIcon(comparisonMetrics.gdd.status)}
                           <span className={`text-sm ${getStatusColor(comparisonMetrics.gdd.status)}`}>
@@ -417,7 +493,7 @@ export function ClimateDashboard({ data, requestInfo, onBackToForm }: ClimateDas
                         <div className="flex items-center gap-2">
                           {getStatusIcon(comparisonMetrics.frostDays.status)}
                           <span className={`text-sm ${getStatusColor(comparisonMetrics.frostDays.status)}`}>
-                            {comparisonMetrics.frostDays.value} días
+                            {comparisonMetrics.frostDays.value.toFixed(0)} días
                           </span>
                         </div>
                       </div>
@@ -427,7 +503,7 @@ export function ClimateDashboard({ data, requestInfo, onBackToForm }: ClimateDas
                         <div className="flex items-center gap-2">
                           {getStatusIcon(comparisonMetrics.waterDeficit.status)}
                           <span className={`text-sm ${getStatusColor(comparisonMetrics.waterDeficit.status)}`}>
-                            {comparisonMetrics.waterDeficit.value}mm
+                            {comparisonMetrics.waterDeficit.value.toFixed(1)}mm
                           </span>
                         </div>
                       </div>
@@ -471,9 +547,10 @@ export function ClimateDashboard({ data, requestInfo, onBackToForm }: ClimateDas
                 <CardTitle className="text-sm font-medium">Temperatura Media</CardTitle>
               </CardHeader>
               <CardContent>
-                {/* ✅ CAMBIO: 2 decimales */}
                 <div className="text-2xl font-bold">{fmt2(liveAllYear?.summary?.avgTemperature)}°C</div>
-                <p className="text-xs text-muted-foreground mt-1">promedio recalculado del período</p>
+                <p className="text-xs text-muted-foreground mt-1">
+                  {isHistorical ? "media anual (histórico)" : "promedio recalculado del período"}
+                </p>
               </CardContent>
             </Card>
           </div>
@@ -488,7 +565,7 @@ export function ClimateDashboard({ data, requestInfo, onBackToForm }: ClimateDas
             </CardHeader>
             <CardContent>
               <div className="space-y-3">
-                {liveAllYear.warnings.length > 0 ? (
+                {liveAllYear.warnings?.length > 0 ? (
                   liveAllYear.warnings.map((warning: string, index: number) => (
                     <Alert key={index} variant="destructive">
                       <AlertDescription>{warning}</AlertDescription>
@@ -522,7 +599,9 @@ export function ClimateDashboard({ data, requestInfo, onBackToForm }: ClimateDas
               <CardTitle className="flex items-center gap-2 text-green-700">
                 🌱 Recomendación de Variedades de Pistacho
               </CardTitle>
-              <CardDescription>Descubre qué variedades de pistacho son más adecuadas para estas condiciones climáticas</CardDescription>
+              <CardDescription>
+                Descubre qué variedades de pistacho son más adecuadas para estas condiciones climáticas
+              </CardDescription>
             </CardHeader>
             <CardContent>
               <div className="flex items-center justify-between">
@@ -574,7 +653,7 @@ export function ClimateDashboard({ data, requestInfo, onBackToForm }: ClimateDas
               </CardHeader>
               <CardContent>
                 <div className="space-y-4">
-                  {liveAllYear.warnings.length > 0 && (
+                  {liveAllYear.warnings?.length > 0 && (
                     <div className="space-y-3">
                       <h4 className="font-medium">Riesgos Identificados:</h4>
                       {liveAllYear.warnings.map((warning: string, index: number) => (

@@ -19,7 +19,6 @@ function normalizeToYYYYMMDD(input?: string) {
 
 function toDateOrNull(yyyyMMdd: string) {
   if (!isYYYYMMDD(yyyyMMdd)) return null
-  // IMPORTANTE: T00:00:00 en "local" está bien si la string ya es día puro.
   const d = new Date(`${yyyyMMdd}T00:00:00`)
   return Number.isFinite(d.getTime()) ? d : null
 }
@@ -35,13 +34,57 @@ function addDaysYYYYMMDD(baseYYYYMMDD: string, days: number) {
   return d.toISOString().slice(0, 10)
 }
 
+function clampYYYYMMDD(s: string) {
+  // defensa por si llega algo raro
+  return normalizeToYYYYMMDD(s)
+}
+
+function sortAndDedupeByDate<T extends { date: string }>(rows: T[]) {
+  const map = new Map<string, T>()
+  for (const r of rows) {
+    const key = clampYYYYMMDD(r.date)
+    if (!key) continue
+    // si hay duplicado, nos quedamos el último (normalmente idéntico)
+    map.set(key, { ...r, date: key })
+  }
+  return [...map.values()].sort((a, b) => (a.date < b.date ? -1 : a.date > b.date ? 1 : 0))
+}
+
+function splitRangeIntoChunks(startStr: string, endStr: string, maxDaysInclusive: number) {
+  const start = toDateOrNull(startStr)
+  const end = toDateOrNull(endStr)
+  if (!start || !end) return []
+
+  const chunks: Array<{ start: string; end: string }> = []
+  let cursor = new Date(start)
+
+  while (cursor.getTime() <= end.getTime()) {
+    const chunkStart = new Date(cursor)
+    const chunkEnd = new Date(cursor)
+    chunkEnd.setDate(chunkEnd.getDate() + (maxDaysInclusive - 1))
+    if (chunkEnd.getTime() > end.getTime()) chunkEnd.setTime(end.getTime())
+
+    const s = chunkStart.toISOString().slice(0, 10)
+    const e = chunkEnd.toISOString().slice(0, 10)
+    chunks.push({ start: s, end: e })
+
+    // siguiente día tras el chunkEnd
+    cursor = new Date(chunkEnd)
+    cursor.setDate(cursor.getDate() + 1)
+  }
+
+  return chunks
+}
+
 export async function POST(request: NextRequest) {
   try {
-    const body = (await request.json()) as Partial<ClimateRequest>
+    const body = (await request.json()) as Partial<ClimateRequest> & {
+      isHistorical?: boolean
+    }
+
     const origin = process.env.INTERNAL_BASE_URL || request.nextUrl.origin
-
-
     const isAemet = body.source === "AEMET"
+    const isHistorical = !!(body as any)?.isHistorical
 
     // ✅ source siempre obligatorio
     if (!body.source) {
@@ -102,6 +145,9 @@ export async function POST(request: NextRequest) {
     const daysDiffInclusive = diffDaysInclusive(startDateObj, endDateObj)
     const dayCount = daysDiffInclusive - 1 // mantengo tu dayCount anterior (end-start)
 
+    // --------------------
+    // AEMET (forecast)
+    // --------------------
     if (isAemet) {
       // AEMET: forecast futuro y máximo 7 días
       if (startStr < todayStr) {
@@ -114,7 +160,6 @@ export async function POST(request: NextRequest) {
         return NextResponse.json({ success: false, error: "Rango de fechas excedido (máx 7 días)" }, { status: 400 })
       }
 
-      // ✅ Opción A: AEMET DIRECTO (igual que Postman)
       const aemetRes = await fetch(`${origin}/api/weather/aemet`, {
         method: "POST",
         headers: { "content-type": "application/json" },
@@ -146,28 +191,30 @@ export async function POST(request: NextRequest) {
         source: "AEMET",
         data: aemetPayload.data,
         requestInfo: {
+          source: "AEMET",
           latitude: 0,
           longitude: 0,
           startDate: startStr,
           endDate: endStr,
           dayCount,
+          isHistorical: false,
           postalCode: String(body.postalCode).trim(),
           municipio: aemetPayload.municipio,
+          municipioNombre: aemetPayload.municipioNombre,
         },
       })
     }
 
-    // ✅ Resto (NASA/ERA5/SIAR) sigue igual: vía WeatherService
+    // --------------------
+    // Resto (NASA/ERA5/SIAR)
+    // --------------------
     if (dayCount < 0) {
       return NextResponse.json({ success: false, error: "endDate must be >= startDate" }, { status: 400 })
-    }
-    if (dayCount > 730) {
-      return NextResponse.json({ success: false, error: "Date range cannot exceed 2 years" }, { status: 400 })
     }
 
     const weatherService = new WeatherService(origin)
 
-    const climateRequest: ClimateRequest = {
+    const baseReq: ClimateRequest = {
       latitude: Number(body.latitude),
       longitude: Number(body.longitude),
       startDate: startStr,
@@ -176,22 +223,87 @@ export async function POST(request: NextRequest) {
       source: body.source,
     }
 
-    const result = await weatherService.getClimateDataBySource(climateRequest)
+    // ✅ Caso normal: limitamos a 2 años
+    if (!isHistorical) {
+      if (dayCount > 730) {
+        return NextResponse.json(
+          {
+            success: false,
+            error: "Date range cannot exceed 2 years (activa isHistorical para rangos largos)",
+          },
+          { status: 400 },
+        )
+      }
 
-    if (!result.success) {
-      return NextResponse.json(result, { status: 400 })
+      const result = await weatherService.getClimateDataBySource(baseReq)
+      if (!result.success) return NextResponse.json(result, { status: 400 })
+
+      return NextResponse.json({
+        success: true,
+        source: baseReq.source,
+        data: result.data,
+        requestInfo: {
+          source: baseReq.source,
+          latitude: baseReq.latitude,
+          longitude: baseReq.longitude,
+          startDate: baseReq.startDate,
+          endDate: baseReq.endDate,
+          dayCount,
+          isHistorical: false,
+        },
+      })
     }
+
+    // ✅ Histórico: chunking <= 730 días por llamada y merge final
+    const chunks = splitRangeIntoChunks(startStr, endStr, 730)
+
+    if (!chunks.length) {
+      return NextResponse.json({ success: false, error: "No se pudo generar el rango histórico" }, { status: 400 })
+    }
+
+    const merged: any[] = []
+
+    for (const c of chunks) {
+      const chunkReq: ClimateRequest = {
+        ...baseReq,
+        startDate: c.start,
+        endDate: c.end,
+      }
+
+      const r = await weatherService.getClimateDataBySource(chunkReq)
+      if (!r.success) {
+        return NextResponse.json(
+          {
+            success: false,
+            error: r.error || "Error obteniendo chunk histórico",
+            source: baseReq.source,
+            debug: { chunk: c },
+          },
+          { status: 400 },
+        )
+      }
+
+      if (Array.isArray(r.data)) merged.push(...r.data)
+    }
+
+    const finalData = sortAndDedupeByDate(merged)
+
+    const yearsCount = new Set(finalData.map((d: any) => String(d.date || "").slice(0, 4)).filter(Boolean)).size
 
     return NextResponse.json({
       success: true,
-      source: climateRequest.source,
-      data: result.data,
+      source: baseReq.source,
+      data: finalData,
       requestInfo: {
-        latitude: climateRequest.latitude,
-        longitude: climateRequest.longitude,
-        startDate: climateRequest.startDate,
-        endDate: climateRequest.endDate,
-        dayCount,
+        source: baseReq.source,
+        latitude: baseReq.latitude,
+        longitude: baseReq.longitude,
+        startDate: startStr,
+        endDate: endStr,
+        dayCount: diffDaysInclusive(startDateObj, endDateObj) - 1,
+        isHistorical: true,
+        yearsCount,
+        chunksCount: chunks.length,
       },
     })
   } catch (error) {

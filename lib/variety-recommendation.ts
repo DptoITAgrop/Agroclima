@@ -23,8 +23,8 @@ export interface ClimateProfile {
   frostDays: number // P90 de días con helada (Mar–Abr)
 
   totalPrecipitation: number // Mediana anual (todas las fechas disponibles)
-  waterDeficit: number // P90 de déficit hídrico en temporada (Mar–Oct)
-  totalGDD: number // P10 de GDD (Mar–Oct)
+  waterDeficit: number // P90 de déficit hídrico en temporada (Abr–Oct)
+  totalGDD: number // P10 de GDD (Abr–Oct)
 
   heatStressDays: number // P90 de días >40°C (Jun–Aug)
   extremeColdDays: number // P90 de días < -5°C (Nov–Feb)
@@ -50,7 +50,7 @@ type CampaignAgg = {
   springFrostDays: number
   springFrostHours: number
 
-  // Growing season heat: Mar–Oct
+  // Growing season heat: Abr–Oct
   seasonGDD: number
   seasonPrecip: number
   seasonETC: number
@@ -92,9 +92,14 @@ function isWinter(d: Date): boolean {
   return m === 11 || m === 12 || m === 1 || m === 2
 }
 
+/**
+ * ✅ NUEVA REGLA: GDD temporada de cultivo
+ * 1 abril -> 31 octubre
+ * => Abr, May, Jun, Jul, Ago, Sep, Oct
+ */
 function isGrowingSeason(d: Date): boolean {
   const m = d.getMonth() + 1
-  return m >= 3 && m <= 10
+  return m >= 4 && m <= 10
 }
 
 function isSpringFrostWindow(d: Date): boolean {
@@ -108,6 +113,7 @@ function isSummer(d: Date): boolean {
 }
 
 export class VarietyRecommendationEngine {
+  // (No se usa directamente ahora, pero lo dejo por si lo quieres para extensiones futuras)
   private calculator = new ClimateCalculator()
 
   /**
@@ -119,7 +125,6 @@ export class VarietyRecommendationEngine {
   ): VarietyRecommendation[] {
     // Seguridad mínima: sin campaña completa no hay recomendación real
     if (!climateData?.length || climateData.length < 300) {
-      // (Puedes convertir esto en throw si prefieres que la API devuelva 400)
       return PISTACHIO_VARIETIES.filter((v) => v.type === "female")
         .map((v) => ({
           variety: v,
@@ -183,7 +188,7 @@ export class VarietyRecommendationEngine {
         if ((day.temperature_min ?? 999) < -5) agg.winterExtremeColdDays += 1
       }
 
-      // Growing season (Mar–Oct) -> campaña del año natural
+      // Growing season (Abr–Oct) -> campaña del año natural
       if (isGrowingSeason(d)) {
         const y = d.getFullYear()
         const agg = ensure(y)
@@ -211,11 +216,10 @@ export class VarietyRecommendationEngine {
     const years = [...byYear.keys()].sort((a, b) => a - b)
 
     // Si no tenemos al menos 1 invierno y 1 temporada, bajar fiabilidad
-    // (no rompemos, pero los percentiles tenderán a 0)
     const winterChill = years.map((y) => byYear.get(y)!.winterChillHours).filter((v) => v > 0)
     const seasonGDD = years.map((y) => byYear.get(y)!.seasonGDD).filter((v) => v > 0)
 
-    // Water deficit por campaña (Mar–Oct)
+    // Water deficit por campaña (Abr–Oct)
     const waterDeficitSeason = years.map((y) => {
       const a = byYear.get(y)!
       return Math.max(0, a.seasonETC - a.seasonPrecip)
@@ -237,7 +241,6 @@ export class VarietyRecommendationEngine {
 
     // Precipitación anual “informativa” (mediana)
     const annualPrecip = climateData.reduce((sum, day) => sum + (day.precipitation || 0), 0)
-    // Si tienes varios años, esto es “precip total del rango”; la mostramos como mediana anual estimada:
     const approxYears = Math.max(1, new Set(climateData.map((d) => parseISODate(d.date).getFullYear())).size)
     const medianAnnualPrecip = annualPrecip / approxYears
 
@@ -258,7 +261,7 @@ export class VarietyRecommendationEngine {
       minTemperature: Number.parseFloat(minTemperature.toFixed(1)),
       maxTemperature: Number.parseFloat(maxTemperature.toFixed(1)),
 
-      // ✅ “totales” ya NO son totales del rango, son métricas anuales conservadoras por campaña
+      // ✅ métricas anuales conservadoras por campaña
       totalChillHours: Math.round(chillP10),
       totalGDD: Math.round(gddP10),
 
@@ -323,7 +326,9 @@ export class VarietyRecommendationEngine {
     if (pollinizers.length) {
       const viablePollinizers = pollinizers.filter((p) => climate.totalChillHours >= p.chillHoursMin)
       if (!viablePollinizers.length) {
-        concerns.push("Polinización en riesgo: los polinizadores sugeridos no alcanzan el mínimo de horas frío en un año desfavorable.")
+        concerns.push(
+          "Polinización en riesgo: los polinizadores sugeridos no alcanzan el mínimo de horas frío en un año desfavorable.",
+        )
         score = score - 15
       }
     }
@@ -344,7 +349,6 @@ export class VarietyRecommendationEngine {
     matching: string[],
     concerns: string[],
   ): number {
-    // ✅ Ya es “anual conservador” (P10 invierno)
     const annualChillHours = climate.totalChillHours
 
     if (annualChillHours >= variety.chillHoursMin && annualChillHours <= variety.chillHoursMax) {
@@ -409,7 +413,6 @@ export class VarietyRecommendationEngine {
     matching: string[],
     concerns: string[],
   ): number {
-    // ✅ Ya es P90 del déficit en Mar–Oct (año malo)
     const waterNeedRatio = (climate.waterDeficit || 0) / variety.annualWaterNeed
 
     if (waterNeedRatio <= 0.3) {
@@ -419,7 +422,9 @@ export class VarietyRecommendationEngine {
       concerns.push(`Déficit hídrico moderado en temporada (P90: ${climate.waterDeficit} mm)`)
       return 80
     } else {
-      concerns.push(`Déficit hídrico significativo (P90: ${climate.waterDeficit} mm vs ${variety.annualWaterNeed} mm)`)
+      concerns.push(
+        `Déficit hídrico significativo (P90: ${climate.waterDeficit} mm vs ${variety.annualWaterNeed} mm)`,
+      )
       return Math.max(30, 100 - waterNeedRatio * 50)
     }
   }
@@ -430,7 +435,6 @@ export class VarietyRecommendationEngine {
     matching: string[],
     concerns: string[],
   ): number {
-    // ✅ Ya es “anual conservador” (P10 Mar–Oct)
     const annualGDD = climate.totalGDD
 
     if (annualGDD >= 1500 && annualGDD <= 3000) {
@@ -453,7 +457,7 @@ export class VarietyRecommendationEngine {
   ): number {
     let riskScore = 100
 
-    // ✅ Heladas en floración (Mar–Abr) P90
+    // Heladas en floración (Mar–Abr) P90
     if (climate.frostDays > 15) {
       concerns.push(`Alto riesgo de heladas en floración (P90: ${climate.frostDays} días Mar–Abr)`)
       riskScore -= 30
@@ -464,7 +468,7 @@ export class VarietyRecommendationEngine {
       matching.push(`Riesgo bajo de heladas en floración (P90: ${climate.frostDays} días Mar–Abr)`)
     }
 
-    // ✅ Estrés térmico P90 (Jun–Ago)
+    // Estrés térmico P90 (Jun–Ago)
     if (climate.heatStressDays > 30) {
       concerns.push(`Alto estrés térmico (P90: ${climate.heatStressDays} días >40°C en verano)`)
       riskScore -= 25
@@ -488,7 +492,6 @@ export class VarietyRecommendationEngine {
       recommendations.push("Programar riegos durante períodos críticos: " + variety.criticalWaterPeriods.join(", "))
     }
 
-    // Ojo: ahora frostDays es Mar–Abr P90 (mucho más real)
     if (climate.frostDays > 5) {
       recommendations.push("Instalar sistema de protección contra heladas (aspersores, calentadores)")
       recommendations.push("Evitar plantación en zonas bajas propensas a heladas")
@@ -507,15 +510,11 @@ export class VarietyRecommendationEngine {
       recommendations.push("Considerar portainjertos resistentes al frío")
     }
 
-    // Ajuste: ahora chillHours es P10 invierno -> condición más real
     if (variety.id === "sirora" && climate.totalChillHours < 600) {
       recommendations.push("Variedad ideal para zonas con pocas horas frío (año desfavorable)")
     }
   }
 
-  /**
-   * Genera reporte detallado de recomendaciones
-   */
   generateDetailedReport(
     recommendations: VarietyRecommendation[],
     climateProfile: ClimateProfile,
@@ -599,7 +598,7 @@ export class VarietyRecommendationEngine {
 
     if (climate.waterDeficit > 500) {
       riskScore += 20
-      factors.push("Alto déficit hídrico en temporada (Mar–Oct)")
+      factors.push("Alto déficit hídrico en temporada (Abr–Oct)")
       mitigation.push("Sistema de riego eficiente")
     }
 
