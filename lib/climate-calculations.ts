@@ -49,6 +49,14 @@ type SeasonalSummary = {
   totalETC: number
   totalPrecipitation: number
   waterDeficit: number
+
+  /**
+   * ✅ NUEVO: útil para UI/debug (no rompe si no lo usas).
+   * - yearsCount: cuántos años/campañas se han detectado para anualizar
+   * - isAnnualized: true si hemos anualizado (multi-año)
+   */
+  yearsCount?: number
+  isAnnualized?: boolean
 }
 
 export class ClimateCalculator {
@@ -68,9 +76,6 @@ export class ClimateCalculator {
   /**
    * Reference Evapotranspiration (ETO) - Hargreaves-Samani (simplified)
    * ETO = 0.0023 * (Tmean + 17.8) * sqrt(Tmax - Tmin) * Ra
-   *
-   * Nota: Ra (MJ/m²/day) -> fórmula original asume Ra en MJ/m²/day.
-   * Si tu solar_radiation no está en MJ, NO lo uses aquí (ahora no lo usamos).
    */
   calculateETO(
     tempMax: number,
@@ -132,7 +137,6 @@ export class ClimateCalculator {
 
   /**
    * GDD simple (base 7°C para consistencia con el resto de la app)
-   * - Si computedChillHeat === true, normalmente ya viene base 7 => no recalculamos.
    */
   calculateGDD(tempMax: number, tempMin: number): number {
     const tempMean = (tempMax + tempMin) / 2
@@ -141,7 +145,6 @@ export class ClimateCalculator {
 
   /**
    * Chill hours simple (lineal bajo umbral 7.2°C)
-   * - Solo útil si NO tienes hourly real.
    */
   calculateChillHours(tempMax: number, tempMin: number): number {
     const tmax = Number.isFinite(tempMax) ? tempMax : 0
@@ -200,31 +203,44 @@ export class ClimateCalculator {
     return month === 11 || month === 12 || month === 1 || month === 2
   }
 
+  /**
+   * ✅ NUEVO: Ventana GDD pistacho:
+   * - desde 1 Abr hasta 31 Oct (inclusive)
+   * => Abr, May, Jun, Jul, Ago, Sep, Oct
+   */
+  private isInGddWindow(dateISO: string): boolean {
+    const { month } = this.getMonthDay(dateISO)
+    return month >= 4 && month <= 10
+  }
+
+  /**
+   * ✅ NUEVO: Año de campaña para invierno (Nov–Feb)
+   * - Nov/Dic 2023 → campaña 2024
+   * - Ene/Feb 2024 → campaña 2024
+   */
+  private winterCampaignYear(dateISO: string): number {
+    const d = new Date(`${dateISO}T00:00:00`)
+    const y = d.getFullYear()
+    const m = d.getMonth() + 1
+    return m >= 11 ? y + 1 : y
+  }
+
   private clamp0(n: number): number {
     return Number.isFinite(n) ? Math.max(0, n) : 0
   }
 
   /**
    * Sanity check físico para ETo/ETc DIARIA.
-   * - Valores diarios típicos: 0–10 mm/día. > 20 casi seguro está escalado/incorrecto.
-   * - Si llega algo absurdo, lo limitamos a un máximo razonable para no romper el déficit.
    */
   private sanitizeDailyET(value: number): number {
     const v = this.safeNum(value, 0)
     if (v <= 0) return 0
-    // Si por alguna fuente viene en escala rara (p.ej. acumulado o mal convertido), cap defensivo
     if (v > 20) return 20
     return v
   }
 
   /**
    * Procesa data diaria y añade ETO/ETC siempre que falten.
-   *
-   * Reglas:
-   * - Si day.eto y day.etc ya vienen > 0, se respetan (pero se sanitizan).
-   * - Si NO vienen, se calculan con Hargreaves + Kc.
-   * - Si computedChillHeat === true -> respeta gdd/chill_hours/frost_hours.
-   * - Si computedChillHeat !== true -> calcula gdd/chill/frost con el método simple.
    *
    * ✅ HF:
    * - Fuera de Nov–Feb => chill_hours = 0
@@ -239,10 +255,8 @@ export class ClimateCalculator {
       const ws = this.safeNum(day.wind_speed)
       const sr = this.safeNum(day.solar_radiation)
 
-      // ✅ lat defensivo (AEMET por CP puede venir sin lat)
       const latSafe = typeof latitude === "number" && Number.isFinite(latitude) ? latitude : 0
 
-      // 1) ETo/ETc: si vienen de la fuente, respétalos. Si no, calcula.
       const incomingEto = this.sanitizeDailyET(this.safeNum((day as any).eto, 0))
       const incomingEtc = this.sanitizeDailyET(this.safeNum((day as any).etc, 0))
 
@@ -293,37 +307,181 @@ export class ClimateCalculator {
   // Summaries & suitability
   // ----------------------------
 
+  /**
+   * ✅ CAMBIO CLAVE:
+   * - Si el dataset tiene >1 año, anualiza automáticamente:
+   *   - GDD: media anual SOLO Abr–Oct
+   *   - Chill: media por campaña de invierno (Nov–Feb)
+   *   - FrostDays / FrostHours / ETO / ETC / Precip / Deficit: media anual calendario
+   *
+   * Así el suitabilityScore deja de "reventar" por acumulación de 20 años.
+   */
   calculateSeasonalSummary(data: ClimateData[]): SeasonalSummary {
-    const totalDays = data.length || 1
+    const safe = Array.isArray(data) ? data : []
+    const totalDays = safe.length || 1
 
-    const totalGDD = data.reduce((sum, day) => sum + this.clamp0(this.safeNum((day as any).gdd)), 0)
+    // Detecta años calendario presentes
+    const calendarYears = new Set<number>()
+    for (const day of safe) {
+      const y = new Date(`${day.date}T00:00:00`).getFullYear()
+      if (Number.isFinite(y)) calendarYears.add(y)
+    }
+    const yearsCount = Math.max(1, calendarYears.size)
 
-    const totalChillHours = data.reduce((sum, day) => {
-      if (!this.isInChillWindow(day.date)) return sum
-      return sum + this.clamp0(this.safeNum((day as any).chill_hours))
-    }, 0)
+    // Si es 1 año (o menos), mantenemos un resumen "normal", pero:
+    // ✅ GDD SOLO Abr–Oct
+    if (yearsCount <= 1) {
+      const totalGDD = safe.reduce((sum, day) => {
+        if (!this.isInGddWindow(day.date)) return sum
+        return sum + this.clamp0(this.safeNum((day as any).gdd))
+      }, 0)
 
-    const totalFrostHours = data.reduce((sum, day) => sum + this.clamp0(this.safeNum((day as any).frost_hours)), 0)
-    const totalETO = data.reduce((sum, day) => sum + this.clamp0(this.safeNum((day as any).eto)), 0)
-    const totalETC = data.reduce((sum, day) => sum + this.clamp0(this.safeNum((day as any).etc)), 0)
-    const totalPrecipitation = data.reduce((sum, day) => sum + this.clamp0(this.safeNum((day as any).precipitation)), 0)
+      const totalChillHours = safe.reduce((sum, day) => {
+        if (!this.isInChillWindow(day.date)) return sum
+        return sum + this.clamp0(this.safeNum((day as any).chill_hours))
+      }, 0)
 
-    const frostDays = data.filter((day) => this.clamp0(this.safeNum((day as any).frost_hours)) > 0).length
-    const avgTemperature = data.reduce((sum, day) => sum + this.safeNum((day as any).temperature_avg), 0) / totalDays
+      const totalFrostHours = safe.reduce((sum, day) => sum + this.clamp0(this.safeNum((day as any).frost_hours)), 0)
+      const totalETO = safe.reduce((sum, day) => sum + this.clamp0(this.safeNum((day as any).eto)), 0)
+      const totalETC = safe.reduce((sum, day) => sum + this.clamp0(this.safeNum((day as any).etc)), 0)
+      const totalPrecipitation = safe.reduce(
+        (sum, day) => sum + this.clamp0(this.safeNum((day as any).precipitation)),
+        0,
+      )
 
-    const deficit = Math.max(0, totalETC - totalPrecipitation)
+      const frostDays = safe.filter((day) => this.clamp0(this.safeNum((day as any).frost_hours)) > 0).length
+      const avgTemperature = safe.reduce((sum, day) => sum + this.safeNum((day as any).temperature_avg), 0) / totalDays
+
+      const deficit = Math.max(0, totalETC - totalPrecipitation)
+
+      return {
+        totalDays: safe.length,
+        avgTemperature: Number.parseFloat(avgTemperature.toFixed(1)),
+        totalGDD: Number.parseFloat(totalGDD.toFixed(1)),
+        totalChillHours: Number.parseFloat(totalChillHours.toFixed(1)),
+        totalFrostHours: Number.parseFloat(totalFrostHours.toFixed(1)),
+        frostDays,
+        totalETO: Number.parseFloat(totalETO.toFixed(1)),
+        totalETC: Number.parseFloat(totalETC.toFixed(1)),
+        totalPrecipitation: Number.parseFloat(totalPrecipitation.toFixed(1)),
+        waterDeficit: Number.parseFloat(deficit.toFixed(1)),
+        yearsCount,
+        isAnnualized: false,
+      }
+    }
+
+    // ----------------------------------------------------------
+    // ✅ MULTI-AÑO: anualizar (media por año/campaña)
+    // ----------------------------------------------------------
+
+    // Agg anual calendario
+    const yearAgg = new Map<
+      number,
+      {
+        days: number
+        tempSum: number
+        gddSeason: number
+        frostHours: number
+        frostDays: number
+        eto: number
+        etc: number
+        precip: number
+      }
+    >()
+
+    const ensureYear = (y: number) => {
+      const existing = yearAgg.get(y)
+      if (existing) return existing
+      const init = { days: 0, tempSum: 0, gddSeason: 0, frostHours: 0, frostDays: 0, eto: 0, etc: 0, precip: 0 }
+      yearAgg.set(y, init)
+      return init
+    }
+
+    // Agg por campaña de invierno (Nov–Feb)
+    const winterAgg = new Map<number, number>() // campaignYear -> chillHoursSum
+
+    const addWinter = (campaignYear: number, chill: number) => {
+      winterAgg.set(campaignYear, (winterAgg.get(campaignYear) ?? 0) + chill)
+    }
+
+    for (const day of safe) {
+      const d = new Date(`${day.date}T00:00:00`)
+      const y = d.getFullYear()
+      if (!Number.isFinite(y)) continue
+
+      const a = ensureYear(y)
+
+      const tavg = this.safeNum((day as any).temperature_avg)
+      a.days += 1
+      a.tempSum += tavg
+
+      // ✅ GDD SOLO Abr–Oct (y por año calendario)
+      if (this.isInGddWindow(day.date)) {
+        a.gddSeason += this.clamp0(this.safeNum((day as any).gdd))
+      }
+
+      const frostH = this.clamp0(this.safeNum((day as any).frost_hours))
+      a.frostHours += frostH
+      if (frostH > 0) a.frostDays += 1
+
+      a.eto += this.clamp0(this.safeNum((day as any).eto))
+      a.etc += this.clamp0(this.safeNum((day as any).etc))
+      a.precip += this.clamp0(this.safeNum((day as any).precipitation))
+
+      // ✅ Chill SOLO Nov–Feb y anualizado por campaña invierno
+      if (this.isInChillWindow(day.date)) {
+        const campaignY = this.winterCampaignYear(day.date)
+        const chill = this.clamp0(this.safeNum((day as any).chill_hours))
+        addWinter(campaignY, chill)
+      }
+    }
+
+    const years = [...yearAgg.keys()].sort((a, b) => a - b)
+    const winterYears = [...winterAgg.keys()].sort((a, b) => a - b)
+
+    const mean = (arr: number[]) => {
+      if (!arr.length) return 0
+      return arr.reduce((s, v) => s + v, 0) / arr.length
+    }
+
+    const yearlyAvgTemps = years.map((yy) => {
+      const a = yearAgg.get(yy)!
+      return a.days ? a.tempSum / a.days : 0
+    })
+
+    const yearlyGddSeason = years.map((yy) => yearAgg.get(yy)!.gddSeason)
+    const yearlyFrostHours = years.map((yy) => yearAgg.get(yy)!.frostHours)
+    const yearlyFrostDays = years.map((yy) => yearAgg.get(yy)!.frostDays)
+    const yearlyETO = years.map((yy) => yearAgg.get(yy)!.eto)
+    const yearlyETC = years.map((yy) => yearAgg.get(yy)!.etc)
+    const yearlyPrecip = years.map((yy) => yearAgg.get(yy)!.precip)
+    const yearlyDeficit = years.map((yy) => Math.max(0, yearAgg.get(yy)!.etc - yearAgg.get(yy)!.precip))
+
+    const yearlyChill = winterYears.map((wy) => winterAgg.get(wy) ?? 0)
+
+    const avgTemperature = mean(yearlyAvgTemps)
+    const totalGDD = mean(yearlyGddSeason)
+    const totalChillHours = mean(yearlyChill)
+    const totalFrostHours = mean(yearlyFrostHours)
+    const frostDays = mean(yearlyFrostDays)
+    const totalETO = mean(yearlyETO)
+    const totalETC = mean(yearlyETC)
+    const totalPrecipitation = mean(yearlyPrecip)
+    const waterDeficit = mean(yearlyDeficit)
 
     return {
-      totalDays: data.length,
+      totalDays: safe.length,
       avgTemperature: Number.parseFloat(avgTemperature.toFixed(1)),
       totalGDD: Number.parseFloat(totalGDD.toFixed(1)),
       totalChillHours: Number.parseFloat(totalChillHours.toFixed(1)),
       totalFrostHours: Number.parseFloat(totalFrostHours.toFixed(1)),
-      frostDays,
+      frostDays: Number.parseFloat(frostDays.toFixed(1)) as any, // (en UI lo usas como number; aquí queda ok)
       totalETO: Number.parseFloat(totalETO.toFixed(1)),
       totalETC: Number.parseFloat(totalETC.toFixed(1)),
       totalPrecipitation: Number.parseFloat(totalPrecipitation.toFixed(1)),
-      waterDeficit: Number.parseFloat(deficit.toFixed(1)),
+      waterDeficit: Number.parseFloat(waterDeficit.toFixed(1)),
+      yearsCount,
+      isAnnualized: true,
     }
   }
 
@@ -340,24 +498,28 @@ export class ClimateCalculator {
       recommendations.push("Horas frío adecuadas para el cultivo de pistacho")
     }
 
-    // Heat units / GDD
+    // Heat units / GDD (✅ ahora es Abr–Oct, y anualizado si histórico)
     if (seasonalSummary.totalGDD < 1500) {
-      warnings.push("Insuficientes grados día para completar el ciclo del pistacho")
+      warnings.push("Insuficientes grados día (Abr–Oct) para completar el ciclo del pistacho")
     } else if (seasonalSummary.totalGDD > 3200) {
-      // ✅ ligeramente más permisivo: exceso de GDD rara vez limita; el problema real es estrés térmico + agua
-      warnings.push("Calor acumulado alto: vigilar estrés térmico y riego en verano")
+      warnings.push("Calor acumulado alto (Abr–Oct): vigilar estrés térmico y riego en verano")
     } else {
-      recommendations.push("Acumulación térmica adecuada")
+      recommendations.push("Acumulación térmica adecuada (Abr–Oct)")
     }
 
     // Frost risk
     if (seasonalSummary.frostDays > 10) {
-      warnings.push(`${seasonalSummary.frostDays} días de helada pueden dañar la floración`)
+      warnings.push(`${seasonalSummary.frostDays.toFixed?.(0) ?? seasonalSummary.frostDays} días de helada pueden dañar la floración`)
     }
 
     // Water deficit
     if (seasonalSummary.waterDeficit > 300) {
       recommendations.push(`Déficit hídrico de ${seasonalSummary.waterDeficit}mm: requiere riego suplementario`)
+    }
+
+    // ✅ Transparencia si es histórico
+    if (seasonalSummary.isAnnualized) {
+      recommendations.push(`Índices anualizados sobre ${seasonalSummary.yearsCount} años/campañas`)
     }
 
     return {
@@ -376,7 +538,10 @@ export class ClimateCalculator {
     // ✅ no penalizar fuerte por "exceso de GDD"
     if (summary.totalGDD > 3400) score -= 8
 
+    // frostDays aquí ya es anual medio si histórico
     if (summary.frostDays > 10) score -= summary.frostDays * 2
+
+    // waterDeficit aquí ya es anual medio si histórico
     if (summary.waterDeficit > 500) score -= Math.min(25, (summary.waterDeficit - 500) / 40)
 
     return Math.max(0, Math.min(100, Math.round(score)))
@@ -414,7 +579,7 @@ export class ClimateCalculator {
       temperatureByYear.push(summary.avgTemperature)
       precipitationByYear.push(summary.totalPrecipitation)
       chillHoursByYear.push(summary.totalChillHours)
-      frostDaysByYear.push(summary.frostDays)
+      frostDaysByYear.push(Number(summary.frostDays) || 0)
     })
 
     const climateStability = this.assessClimateStability(yearlyAverages)
